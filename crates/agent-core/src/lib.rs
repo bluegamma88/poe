@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_TOOL_ROUNDS: usize = 250;
-const SYSTEM_PROMPT: &str = "You are a coding agent.";
+const SYSTEM_PROMPT: &str =
+    "You are a coding agent. Write final responses in plain text, not Markdown.";
 
 pub fn available_tool_definitions() -> Vec<Value> {
     vec![
