@@ -10,7 +10,7 @@ Install the binary:
 cargo install --git https://github.com/bluegamma88/poe
 ```
 
-Then add your model and API key to `config.toml`:
+Then add your model and API key to `~/.poe/config.toml`:
 
 ```toml
 # model = "openai/gpt-oss-120b"
