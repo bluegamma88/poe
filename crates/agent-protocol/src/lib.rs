@@ -121,6 +121,8 @@ pub enum TranscriptMessage {
     },
     Assistant {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCall>,
@@ -371,6 +373,7 @@ mod tests {
                 content: "say hello".to_string(),
             },
             TranscriptMessage::Assistant {
+                reasoning_content: Some("thinking it through".to_string()),
                 content: Some("on it".to_string()),
                 tool_calls: vec![ToolCall {
                     id: "call-1".to_string(),
@@ -388,6 +391,7 @@ mod tests {
 
         assert_eq!(value[0]["role"], "system");
         assert_eq!(value[2]["role"], "assistant");
+        assert_eq!(value[2]["reasoning_content"], "thinking it through");
         assert_eq!(value[2]["tool_calls"][0]["name"], "read_file");
         assert_eq!(value[3]["role"], "tool");
         assert_eq!(
@@ -400,6 +404,7 @@ mod tests {
     #[test]
     fn assistant_message_omits_empty_optional_fields() {
         let value = serde_json::to_value(TranscriptMessage::Assistant {
+            reasoning_content: None,
             content: None,
             tool_calls: Vec::new(),
         })

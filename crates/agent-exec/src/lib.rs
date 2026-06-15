@@ -463,13 +463,14 @@ impl ScriptedModel {
         };
 
         let mut content = String::new();
+        let mut reasoning_content = String::new();
         let mut tool_calls = Vec::new();
         for event in events.iter().flatten() {
             match event {
                 ModelEvent::AssistantDelta { text } => content.push_str(text),
-                // Reasoning and usage accounting are not part of the persisted
-                // assistant message.
-                ModelEvent::ThinkingDelta { .. } | ModelEvent::Usage(_) => {}
+                ModelEvent::ThinkingDelta { text } => reasoning_content.push_str(text),
+                // Usage accounting is not part of the persisted assistant message.
+                ModelEvent::Usage(_) => {}
                 ModelEvent::ToolCall(call) => tool_calls.push(ToolCall {
                     id: call.id.clone(),
                     name: call.name.clone(),
@@ -478,8 +479,9 @@ impl ScriptedModel {
             }
         }
 
-        if !content.is_empty() || !tool_calls.is_empty() {
+        if !content.is_empty() || !reasoning_content.is_empty() || !tool_calls.is_empty() {
             transcript.push(TranscriptMessage::Assistant {
+                reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
                 content: (!content.is_empty()).then_some(content),
                 tool_calls,
             });
@@ -958,7 +960,55 @@ mod tests {
                     content: "say hello".to_string()
                 },
                 TranscriptMessage::Assistant {
+                    reasoning_content: None,
                     content: Some("hello\n".to_string()),
+                    tool_calls: Vec::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn session_trace_persists_reasoning_content() {
+        let temp = TempDir::new();
+        let sessions_dir = temp.path().join("sessions");
+
+        let exit_code = run(run_with_model_live(
+            ExecOptions {
+                prompt: "think then answer".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+                json: false,
+                sessions_dir: Some(sessions_dir.clone()),
+            },
+            ScriptedModel::stream(vec![
+                Ok(ModelEvent::ThinkingDelta {
+                    text: "first ".to_string(),
+                }),
+                Ok(ModelEvent::ThinkingDelta {
+                    text: "reason".to_string(),
+                }),
+                Ok(ModelEvent::AssistantDelta {
+                    text: "answer\n".to_string(),
+                }),
+            ]),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        ))
+        .expect("run live exec");
+
+        assert_eq!(exit_code, 0);
+
+        let traces = read_traces(&sessions_dir);
+        assert_eq!(traces.len(), 1, "expected exactly one trace file");
+        assert_eq!(
+            traces[0].messages,
+            vec![
+                TranscriptMessage::User {
+                    content: "think then answer".to_string()
+                },
+                TranscriptMessage::Assistant {
+                    reasoning_content: Some("first reason".to_string()),
+                    content: Some("answer\n".to_string()),
                     tool_calls: Vec::new(),
                 },
             ]

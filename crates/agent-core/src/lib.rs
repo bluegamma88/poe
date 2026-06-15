@@ -379,6 +379,7 @@ impl OpenRouterClient {
             let mut buffer = String::new();
             let mut tool_calls = ToolCallAccumulator::default();
             let mut assistant_text = String::new();
+            let mut reasoning_content = String::new();
             let mut stream_done = false;
 
             while let Some(chunk) = bytes.next().await {
@@ -408,6 +409,7 @@ impl OpenRouterClient {
                                 yield Ok(ModelEvent::AssistantDelta { text });
                             }
                             Ok(ChatChunkEvent::ThinkingDelta(text)) => {
+                                reasoning_content.push_str(&text);
                                 yield Ok(ModelEvent::ThinkingDelta { text });
                             }
                             Ok(ChatChunkEvent::ToolCallDelta(delta)) => {
@@ -438,8 +440,9 @@ impl OpenRouterClient {
                 }
             };
 
-            if (!assistant_text.is_empty() || !tool_calls.is_empty())
-                && let Err(error) = push_assistant_message(&state, assistant_text, &tool_calls)
+            if (!assistant_text.is_empty() || !reasoning_content.is_empty() || !tool_calls.is_empty())
+                && let Err(error) =
+                    push_assistant_message(&state, assistant_text, reasoning_content, &tool_calls)
             {
                 yield Err(error);
                 return;
@@ -455,12 +458,17 @@ impl OpenRouterClient {
 fn push_assistant_message(
     state: &Arc<Mutex<Vec<ChatMessage>>>,
     content: String,
+    reasoning_content: String,
     tool_calls: &[ModelToolCall],
 ) -> Result<(), ModelError> {
     let mut messages = state
         .lock()
         .map_err(|_| ModelError::new("OpenRouter conversation state is unavailable"))?;
-    messages.push(ChatMessage::assistant(content, tool_calls));
+    messages.push(ChatMessage::assistant(
+        content,
+        reasoning_content,
+        tool_calls,
+    ));
     Ok(())
 }
 
@@ -519,7 +527,7 @@ fn parse_chat_chunk(data: &str) -> Result<ChatChunkEvent, ModelError> {
     }
 
     for choice in chunk.choices {
-        if let Some(reasoning) = choice.delta.reasoning
+        if let Some(reasoning) = choice.delta.reasoning.or(choice.delta.reasoning_content)
             && !reasoning.is_empty()
         {
             return Ok(ChatChunkEvent::ThinkingDelta(reasoning));
@@ -637,6 +645,8 @@ struct ChatMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenRouterToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
@@ -647,6 +657,7 @@ impl ChatMessage {
         Self {
             role: "system".to_string(),
             content: Some(MessageContent::text(content)),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
@@ -656,15 +667,17 @@ impl ChatMessage {
         Self {
             role: "user".to_string(),
             content: Some(MessageContent::text(content)),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
         }
     }
 
-    fn assistant(content: String, tool_calls: &[ModelToolCall]) -> Self {
+    fn assistant(content: String, reasoning_content: String, tool_calls: &[ModelToolCall]) -> Self {
         Self {
             role: "assistant".to_string(),
             content: (!content.is_empty()).then(|| MessageContent::text(content)),
+            reasoning_content: (!reasoning_content.is_empty()).then_some(reasoning_content),
             tool_calls: (!tool_calls.is_empty())
                 .then(|| tool_calls.iter().map(OpenRouterToolCall::from).collect()),
             tool_call_id: None,
@@ -675,6 +688,7 @@ impl ChatMessage {
         Self {
             role: "tool".to_string(),
             content: Some(MessageContent::text(result.content)),
+            reasoning_content: None,
             tool_calls: None,
             tool_call_id: Some(result.call_id),
         }
@@ -703,6 +717,7 @@ impl ChatMessage {
             },
             // Default to assistant for "assistant" and any unexpected role.
             _ => TranscriptMessage::Assistant {
+                reasoning_content: self.reasoning_content.clone(),
                 content,
                 tool_calls: self
                     .tool_calls
@@ -807,6 +822,7 @@ struct ChatChoice {
 struct ChatDelta {
     content: Option<String>,
     reasoning: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -1083,6 +1099,7 @@ mod tests {
         // An assistant tool-call turn carries no text content.
         let mut assistant = ChatMessage::assistant(
             String::new(),
+            String::new(),
             &[ModelToolCall {
                 id: "call-1".to_string(),
                 name: "read_file".to_string(),
@@ -1100,6 +1117,25 @@ mod tests {
         user.mark_cache_breakpoint();
         match user.to_transcript() {
             TranscriptMessage::User { content } => assert_eq!(content, "hello"),
+            other => panic!("unexpected transcript message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transcript_preserves_assistant_reasoning_content() {
+        let assistant =
+            ChatMessage::assistant("answer".to_string(), "worked through it".to_string(), &[]);
+
+        match assistant.to_transcript() {
+            TranscriptMessage::Assistant {
+                reasoning_content,
+                content,
+                tool_calls,
+            } => {
+                assert_eq!(reasoning_content, Some("worked through it".to_string()));
+                assert_eq!(content, Some("answer".to_string()));
+                assert!(tool_calls.is_empty());
+            }
             other => panic!("unexpected transcript message: {other:?}"),
         }
     }
@@ -1616,6 +1652,14 @@ mod tests {
             .expect("parse chunk");
 
         assert!(matches!(event, ChatChunkEvent::AssistantDelta(text) if text == "hello"));
+    }
+
+    #[test]
+    fn parses_openrouter_reasoning_content_alias_chunks() {
+        let event = parse_chat_chunk(r#"{"choices":[{"delta":{"reasoning_content":"think"}}]}"#)
+            .expect("parse chunk");
+
+        assert!(matches!(event, ChatChunkEvent::ThinkingDelta(text) if text == "think"));
     }
 
     #[test]
