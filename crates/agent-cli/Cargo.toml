@@ -1,0 +1,17 @@
+[package]
+name = "agent-cli"
+version.workspace = true
+edition.workspace = true
+description = "A small coding agent harness. Named after Poe, the AI from Altered Carbon."
+
+[[bin]]
+name = "poe"
+path = "src/main.rs"
+
+[dependencies]
+agent-config = { path = "../agent-config" }
+agent-core = { path = "../agent-core" }
+agent-exec = { path = "../agent-exec" }
+agent-tui = { path = "../agent-tui" }
+clap = { version = "4.5.23", features = ["derive"] }
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread"] }

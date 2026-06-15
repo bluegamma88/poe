@@ -1,0 +1,15 @@
+[package]
+name = "agent-tui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+agent-exec = { path = "../agent-exec" }
+agent-protocol = { path = "../agent-protocol" }
+crossterm = "0.28.1"
+futures-util = "0.3.31"
+ratatui = "0.29.0"
+serde_json = "1.0.117"
+tokio = { version = "1.38.0", features = ["macros", "sync", "time"] }
+unicode-width = "0.2.0"

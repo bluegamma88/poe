@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/agent-protocol",
+    "crates/agent-core",
+    "crates/agent-cli",
+    "crates/agent-exec",
+    "crates/agent-tui",
+    "crates/agent-tools",
+    "crates/agent-config",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
