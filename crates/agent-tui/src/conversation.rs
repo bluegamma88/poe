@@ -4,7 +4,9 @@
 //! Output arrives as a stream of [`Item`]s. While an item can still change it
 //! stays "live" and is redrawn each frame; once finalized it is promoted into
 //! `pending_lines`, then dripped one line per tick into `history_queue`, which
-//! the terminal drains into permanent scrollback.
+//! the terminal drains into permanent scrollback. Finalized logical history is
+//! also retained unwrapped so future terminal resize handling can rebuild
+//! scrollback at a new width.
 //!
 //! Responsibility split with `InlineTerminal`:
 //!
@@ -115,6 +117,9 @@ pub(crate) struct Conversation {
     pub(crate) live: Vec<Item>,
     /// Finalized lines awaiting the paced drip into `history_queue`.
     pub(crate) pending_lines: Vec<HistoryLine>,
+    /// Retained finalized logical history. These lines are unwrapped and form
+    /// the source for full scrollback replay at any terminal width.
+    pub(crate) history_source: Vec<HistoryLine>,
     /// Lines ready to flush into terminal scrollback.
     pub(crate) history_queue: Vec<HistoryLine>,
     /// Animation frame for the running-tool spinner.
@@ -130,7 +135,7 @@ impl Conversation {
     pub(crate) fn start_turn(&mut self, prompt: &str) {
         self.live.clear();
         self.pending_lines.clear();
-        self.history_queue.extend(user_prompt_history_lines(prompt));
+        self.enqueue_history_lines(user_prompt_history_lines(prompt));
     }
 
     pub(crate) fn push_assistant_delta(&mut self, text: &str) {
@@ -185,7 +190,7 @@ impl Conversation {
     /// Push a line directly into scrollback, bypassing the paced drip. Used for
     /// turn-end markers and debug output that should appear immediately.
     pub(crate) fn push_marker(&mut self, text: impl Into<String>) {
-        self.history_queue.push(HistoryLine::normal(text));
+        self.enqueue_history_line(HistoryLine::normal(text));
     }
 
     /// Advance the spinner and release one pending line per tick, pacing the
@@ -198,7 +203,7 @@ impl Conversation {
     pub(crate) fn commit_one_streaming_chunk(&mut self) {
         if !self.pending_lines.is_empty() {
             let line = self.pending_lines.remove(0);
-            self.history_queue.push(line);
+            self.enqueue_history_line(line);
         }
     }
 
@@ -216,25 +221,15 @@ impl Conversation {
 
     /// Drain queued scrollback, wrapping each logical line to `width`.
     pub(crate) fn take_history_lines(&mut self, width: usize) -> Vec<HistoryLine> {
-        let width = width.max(1);
         let lines = std::mem::take(&mut self.history_queue);
-        lines
-            .into_iter()
-            .flat_map(|line| {
-                wrap_line(&line.text, width).into_iter().map(move |text| {
-                    // Pad the user prompt so its background fills the whole row.
-                    let text = if line.kind == LineKind::User {
-                        format!("{text:<width$}")
-                    } else {
-                        text
-                    };
-                    HistoryLine {
-                        text,
-                        kind: line.kind,
-                    }
-                })
-            })
-            .collect()
+        render_history_lines(&lines, width)
+    }
+
+    /// Render all retained finalized history at `width`, without draining the
+    /// incremental scrollback queue. This is the source-backed replay primitive
+    /// resize reflow uses to rebuild scrollback at a new terminal width.
+    pub(crate) fn render_history_lines(&self, width: usize) -> Vec<HistoryLine> {
+        render_history_lines(&self.history_source, width)
     }
 
     /// Append streamed text to the trailing text item, shedding every completed
@@ -285,6 +280,17 @@ impl Conversation {
         self.live
             .iter_mut()
             .find(|item| matches!(item, Item::Tool { call, result: None, .. } if call.id == id))
+    }
+
+    fn enqueue_history_line(&mut self, line: HistoryLine) {
+        self.history_source.push(line.clone());
+        self.history_queue.push(line);
+    }
+
+    fn enqueue_history_lines(&mut self, lines: impl IntoIterator<Item = HistoryLine>) {
+        for line in lines {
+            self.enqueue_history_line(line);
+        }
     }
 }
 
@@ -365,6 +371,27 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
         .collect::<Vec<_>>()
         .chunks(width)
         .map(|chunk| chunk.iter().collect())
+        .collect()
+}
+
+fn render_history_lines(lines: &[HistoryLine], width: usize) -> Vec<HistoryLine> {
+    let width = width.max(1);
+    lines
+        .iter()
+        .flat_map(|line| {
+            wrap_line(&line.text, width).into_iter().map(move |text| {
+                // Pad the user prompt so its background fills the whole row.
+                let text = if line.kind == LineKind::User {
+                    format!("{text:<width$}")
+                } else {
+                    text
+                };
+                HistoryLine {
+                    text,
+                    kind: line.kind,
+                }
+            })
+        })
         .collect()
 }
 
@@ -504,6 +531,7 @@ mod tests {
 
         assert!(conv.live.is_empty());
         assert_eq!(conv.history_queue, vec![HistoryLine::normal("partial")]);
+        assert_eq!(conv.history_source, vec![HistoryLine::normal("partial")]);
     }
 
     #[test]
@@ -514,6 +542,54 @@ mod tests {
         let lines = conv.take_history_lines(10);
 
         assert_eq!(lines, vec![HistoryLine::user("> hi      ")]);
+    }
+
+    #[test]
+    fn retained_history_replays_after_incremental_queue_is_drained() {
+        let mut conv = Conversation::new();
+        conv.start_turn("hello user");
+        conv.push_thinking_delta("think\nmore");
+        conv.push_assistant_delta("answer line\npartial answer");
+        conv.start_tool(tool_call("call-1", "cargo test"));
+        conv.push_tool_output("call-1", "line1\nline2\nline3\nline4\n");
+        conv.finish_tool(
+            "call-1",
+            ToolResult {
+                exit_code: Some(0),
+                summary: "ok".to_string(),
+            },
+        );
+        conv.push_notice("patch applied");
+        conv.finalize_all();
+        conv.push_marker("turn complete");
+
+        let mut drained = conv.clone();
+        let incremental = drained.take_history_lines(8);
+
+        assert!(drained.history_queue.is_empty());
+        assert_eq!(drained.render_history_lines(8), incremental);
+    }
+
+    #[test]
+    fn retained_history_can_replay_at_different_widths() {
+        let mut conv = Conversation::new();
+        conv.start_turn("abcdef");
+        conv.push_assistant_delta("ghijkl");
+        conv.finalize_all();
+
+        assert_eq!(
+            conv.take_history_lines(8),
+            vec![HistoryLine::user("> abcdef"), HistoryLine::normal("ghijkl"),]
+        );
+        assert_eq!(
+            conv.render_history_lines(4),
+            vec![
+                HistoryLine::user("> ab"),
+                HistoryLine::user("cdef"),
+                HistoryLine::normal("ghij"),
+                HistoryLine::normal("kl"),
+            ]
+        );
     }
 
     #[test]

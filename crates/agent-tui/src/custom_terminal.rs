@@ -112,6 +112,17 @@ impl<B: Backend> Terminal<B> {
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
+    /// Reset viewport bookkeeping to `area` with no visible history above it,
+    /// after the screen and scrollback have been purged for resize reflow.
+    /// Pins the viewport to the bottom regime and forces the next draw to fully
+    /// repaint the viewport.
+    pub fn reset_for_reflow(&mut self, area: Rect) {
+        self.bottom_pinned = true;
+        self.set_viewport_area(area);
+        self.visible_history_rows = 0;
+        self.invalidate_viewport();
+    }
+
     /// Clear stale content when the viewport area changes.
     ///
     /// On the first draw the old viewport is still empty, so the clear starts

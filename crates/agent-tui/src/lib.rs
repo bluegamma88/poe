@@ -4,6 +4,7 @@ mod composer;
 mod conversation;
 mod custom_terminal;
 mod history_insert;
+mod resize_reflow;
 
 use std::{
     error::Error,
@@ -11,7 +12,7 @@ use std::{
     io::Stdout,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent_core::{AgentSession, ModelClient};
@@ -67,6 +68,13 @@ where
     let mut tick = time::interval(COMMIT_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Source-backed scrollback reflow on terminal resize. Off by default; the
+    // replay path rewrites owned scrollback and is opt-in until verified across
+    // terminals, matching the reference TUI's feature gate.
+    let reflow_enabled = std::env::var_os("POE_TUI_RESIZE_REFLOW").is_some();
+    let mut reflow = resize_reflow::ResizeReflowState::default();
+    reflow.init_width(terminal.screen_width());
+
     terminal.flush_welcome(&app)?;
     terminal.draw(&mut app)?;
 
@@ -97,6 +105,14 @@ where
                 _ = tick.tick() => {
                     app.log.on_tick();
                 }
+            }
+        }
+
+        if reflow_enabled {
+            let now = Instant::now();
+            reflow.observe(terminal.screen_width(), now);
+            if let Some(width) = reflow.take_due(now) {
+                terminal.reflow_scrollback(&mut app, width)?;
             }
         }
 
@@ -380,6 +396,56 @@ impl InlineTerminal {
     fn flush_welcome(&mut self, app: &AppState) -> Result<(), TuiError> {
         let lines = welcome_history_lines(app);
         history_insert::insert_history_lines(&mut self.terminal, &lines)?;
+        Ok(())
+    }
+
+    /// Current terminal width, or 0 if the backend cannot be probed.
+    fn screen_width(&self) -> u16 {
+        self.terminal.size().map(|size| size.width).unwrap_or(0)
+    }
+
+    /// Rebuild owned scrollback from retained conversation history at `width`,
+    /// discarding the stale wrapping the terminal applied to already-emitted
+    /// rows after a width change.
+    ///
+    /// Only the bottom-pinned (steady-state) regime is rebuilt: before the
+    /// viewport fills the screen there is little scrollback above it and the
+    /// next normal draw re-wraps the live region anyway. The full retained
+    /// history is re-emitted without a row cap, so a very long session replays
+    /// everything here — a cap is future work.
+    fn reflow_scrollback(&mut self, app: &mut AppState, width: u16) -> Result<(), TuiError> {
+        if !self.terminal.is_bottom_pinned() {
+            return Ok(());
+        }
+        let width = width.max(1);
+        let lines = app.log.render_history_lines(width as usize);
+        io::stdout().sync_update(|_| {
+            let terminal = &mut self.terminal;
+            let size = terminal.size()?;
+            let height = terminal.viewport_area.height.min(size.height);
+            let area = Rect::new(0, size.height.saturating_sub(height), width, height);
+
+            // Take ownership of the screen: purge scrollback and clear the
+            // visible screen, throwing away the terminal's own reflow of the
+            // old-width rows in favour of our source-backed replay.
+            let backend = terminal.backend_mut();
+            crossterm::queue!(
+                backend,
+                crossterm::cursor::MoveTo(0, 0),
+                TerminalClear(ClearType::Purge),
+                TerminalClear(ClearType::All),
+            )?;
+
+            // Re-establish the viewport at the new width with empty scrollback
+            // above it, then replay history through the normal insert path so
+            // overflow scrolls back into terminal scrollback naturally. With no
+            // rows above the viewport there is nowhere to replay into.
+            terminal.reset_for_reflow(area);
+            if area.top() > 0 {
+                history_insert::insert_history_lines(terminal, &lines)?;
+            }
+            io::Result::Ok(())
+        })??;
         Ok(())
     }
 
