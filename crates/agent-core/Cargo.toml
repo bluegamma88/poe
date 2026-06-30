@@ -11,6 +11,8 @@ futures-util = "0.3.31"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.117"
+tokio = { version = "1.38.0", features = ["time"] }
 
 [dev-dependencies]
 futures-executor = "0.3.31"
+tokio = { version = "1.38.0", features = ["macros", "rt-multi-thread", "time"] }

@@ -8,6 +8,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use agent_protocol::{Event, Op, TokenUsage, ToolCall, ToolResult, TranscriptMessage};
@@ -17,13 +18,19 @@ use agent_tools::{
 };
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
+use reqwest::{
+    StatusCode,
+    header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RETRY_AFTER},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_TOOL_ROUNDS: usize = 250;
 const SYSTEM_PROMPT: &str =
     "You are a coding agent. Write final responses in plain text, not Markdown.";
+const OPENROUTER_RETRY_MAX_ATTEMPTS: usize = 3;
+const OPENROUTER_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+const OPENROUTER_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 
 pub fn available_tool_definitions() -> Vec<Value> {
     vec![
@@ -222,6 +229,70 @@ pub trait ModelClient: Clone + Send + 'static {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RetryPolicy {
+    max_attempts: usize,
+    base_delay: Duration,
+    max_delay: Duration,
+}
+
+impl RetryPolicy {
+    fn max_attempts(&self) -> usize {
+        self.max_attempts.max(1)
+    }
+
+    fn retry_delay(&self, failed_attempt: usize, retry_after: Option<Duration>) -> Duration {
+        retry_after.unwrap_or_else(|| self.backoff_delay(failed_attempt))
+    }
+
+    fn backoff_delay(&self, failed_attempt: usize) -> Duration {
+        let multiplier = 1_u32
+            .checked_shl(failed_attempt.saturating_sub(1).min(31) as u32)
+            .unwrap_or(u32::MAX);
+        self.base_delay
+            .saturating_mul(multiplier)
+            .min(self.max_delay)
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: OPENROUTER_RETRY_MAX_ATTEMPTS,
+            base_delay: OPENROUTER_RETRY_BASE_DELAY,
+            max_delay: OPENROUTER_RETRY_MAX_DELAY,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct OpenRouterAttemptError {
+    message: String,
+    retryable: bool,
+    retry_after: Option<Duration>,
+}
+
+impl OpenRouterAttemptError {
+    fn new(message: impl Into<String>, retryable: bool, retry_after: Option<Duration>) -> Self {
+        Self {
+            message: message.into(),
+            retryable,
+            retry_after,
+        }
+    }
+
+    fn into_model_error(self) -> ModelError {
+        ModelError::new(self.message)
+    }
+
+    fn into_exhausted_model_error(self, attempts: usize) -> ModelError {
+        ModelError::new(format!(
+            "OpenRouter request failed after {attempts} attempts: {}",
+            self.message
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct OpenRouterClient {
     http: reqwest::Client,
@@ -229,6 +300,7 @@ pub struct OpenRouterClient {
     model: String,
     api_key: String,
     messages: Arc<Mutex<Vec<ChatMessage>>>,
+    retry_policy: RetryPolicy,
 }
 
 impl OpenRouterClient {
@@ -239,6 +311,7 @@ impl OpenRouterClient {
             model: model.into(),
             api_key: api_key.into(),
             messages: Arc::new(Mutex::new(Vec::new())),
+            retry_policy: RetryPolicy::default(),
         }
     }
 
@@ -253,7 +326,14 @@ impl OpenRouterClient {
             model: model.into(),
             api_key: api_key.into(),
             messages: Arc::new(Mutex::new(Vec::new())),
+            retry_policy: RetryPolicy::default(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 }
 
@@ -315,6 +395,7 @@ impl OpenRouterClient {
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let api_key = self.api_key.clone();
+        let retry_policy = self.retry_policy;
         let mut messages = self
             .messages
             .lock()
@@ -347,113 +428,234 @@ impl OpenRouterClient {
                 tools: available_tool_definitions(),
                 reasoning: ReasoningConfig { enabled: true },
             };
+            let max_attempts = retry_policy.max_attempts();
 
-            let response = match http
-                .post(endpoint)
-                .headers(openrouter_headers(&api_key))
-                .json(&request)
-                .send()
+            'attempts: for attempt in 1..=max_attempts {
+                let response = match send_openrouter_request(
+                    &http,
+                    &endpoint,
+                    &api_key,
+                    &request,
+                )
                 .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    yield Err(ModelError::new(format!("OpenRouter request failed: {error}")));
-                    return;
-                }
-            };
-
-            if !response.status().is_success() {
-                let status = response.status();
-                let message = match response.text().await {
-                    Ok(body) => parse_openrouter_error(&body)
-                        .unwrap_or_else(|| body.trim().to_string()),
-                    Err(error) => format!("failed to read error body: {error}"),
-                };
-
-                yield Err(ModelError::new(format!(
-                    "OpenRouter request failed with HTTP {status}: {message}"
-                )));
-                return;
-            }
-
-            let mut bytes = response.bytes_stream();
-            let mut buffer = String::new();
-            let mut tool_calls = ToolCallAccumulator::default();
-            let mut assistant_text = String::new();
-            let mut reasoning_content = String::new();
-            let mut stream_done = false;
-
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(chunk) => chunk,
+                {
+                    Ok(response) => response,
                     Err(error) => {
-                        yield Err(ModelError::new(format!("OpenRouter stream failed: {error}")));
+                        if should_retry_attempt(&error, attempt, max_attempts) {
+                            let delay = retry_policy.retry_delay(attempt, error.retry_after);
+                            sleep_retry_delay(delay).await;
+                            continue 'attempts;
+                        }
+
+                        if error.retryable {
+                            yield Err(error.into_exhausted_model_error(max_attempts));
+                        } else {
+                            yield Err(error.into_model_error());
+                        }
                         return;
                     }
                 };
 
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
+                let mut bytes = response.bytes_stream();
+                let mut buffer = String::new();
+                let mut tool_calls = ToolCallAccumulator::default();
+                let mut assistant_text = String::new();
+                let mut reasoning_content = String::new();
+                let mut stream_done = false;
+                let mut emitted_event = false;
 
-                while let Some(newline) = buffer.find('\n') {
-                    let line = buffer[..newline].trim_end_matches('\r').to_string();
-                    buffer.drain(..=newline);
+                while let Some(chunk) = bytes.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let error = OpenRouterAttemptError::new(
+                                format!("OpenRouter stream failed: {error}"),
+                                is_retryable_stream_error(&error),
+                                None,
+                            );
 
-                    match parse_sse_line(&line) {
-                        SseLine::Ignore => {}
-                        SseLine::Done => {
-                            stream_done = true;
-                            break;
+                            if !emitted_event && should_retry_attempt(&error, attempt, max_attempts)
+                            {
+                                let delay = retry_policy.retry_delay(attempt, error.retry_after);
+                                sleep_retry_delay(delay).await;
+                                continue 'attempts;
+                            }
+
+                            if error.retryable && !emitted_event {
+                                yield Err(error.into_exhausted_model_error(max_attempts));
+                            } else {
+                                yield Err(error.into_model_error());
+                            }
+                            return;
                         }
-                        SseLine::Data(data) => match parse_chat_chunk(&data) {
-                            Ok(ChatChunkEvent::AssistantDelta(text)) => {
-                                assistant_text.push_str(&text);
-                                yield Ok(ModelEvent::AssistantDelta { text });
+                    };
+
+                    buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+                    while let Some(newline) = buffer.find('\n') {
+                        let line = buffer[..newline].trim_end_matches('\r').to_string();
+                        buffer.drain(..=newline);
+
+                        match parse_sse_line(&line) {
+                            SseLine::Ignore => {}
+                            SseLine::Done => {
+                                stream_done = true;
+                                break;
                             }
-                            Ok(ChatChunkEvent::ThinkingDelta(text)) => {
-                                reasoning_content.push_str(&text);
-                                yield Ok(ModelEvent::ThinkingDelta { text });
-                            }
-                            Ok(ChatChunkEvent::ToolCallDelta(delta)) => {
-                                tool_calls.apply(delta);
-                            }
-                            Ok(ChatChunkEvent::Usage(usage)) => {
-                                yield Ok(ModelEvent::Usage(usage));
-                            }
-                            Ok(ChatChunkEvent::None) => {}
-                            Err(error) => {
-                                yield Err(error);
-                                return;
-                            }
-                        },
+                            SseLine::Data(data) => match parse_chat_chunk_attempt(&data) {
+                                Ok(ChatChunkEvent::AssistantDelta(text)) => {
+                                    emitted_event = true;
+                                    assistant_text.push_str(&text);
+                                    yield Ok(ModelEvent::AssistantDelta { text });
+                                }
+                                Ok(ChatChunkEvent::ThinkingDelta(text)) => {
+                                    emitted_event = true;
+                                    reasoning_content.push_str(&text);
+                                    yield Ok(ModelEvent::ThinkingDelta { text });
+                                }
+                                Ok(ChatChunkEvent::ToolCallDelta(delta)) => {
+                                    tool_calls.apply(delta);
+                                }
+                                Ok(ChatChunkEvent::Usage(usage)) => {
+                                    emitted_event = true;
+                                    yield Ok(ModelEvent::Usage(usage));
+                                }
+                                Ok(ChatChunkEvent::None) => {}
+                                Err(error) => {
+                                    if !emitted_event
+                                        && should_retry_attempt(&error, attempt, max_attempts)
+                                    {
+                                        let delay =
+                                            retry_policy.retry_delay(attempt, error.retry_after);
+                                        sleep_retry_delay(delay).await;
+                                        continue 'attempts;
+                                    }
+
+                                    if error.retryable && !emitted_event {
+                                        yield Err(error.into_exhausted_model_error(max_attempts));
+                                    } else {
+                                        yield Err(error.into_model_error());
+                                    }
+                                    return;
+                                }
+                            },
+                        }
+                    }
+
+                    if stream_done {
+                        break;
                     }
                 }
 
-                if stream_done {
-                    break;
-                }
-            }
+                let tool_calls = match tool_calls.finish() {
+                    Ok(tool_calls) => tool_calls,
+                    Err(error) => {
+                        yield Err(error);
+                        return;
+                    }
+                };
 
-            let tool_calls = match tool_calls.finish() {
-                Ok(tool_calls) => tool_calls,
-                Err(error) => {
+                if (!assistant_text.is_empty() || !reasoning_content.is_empty() || !tool_calls.is_empty())
+                    && let Err(error) =
+                        push_assistant_message(&state, assistant_text, reasoning_content, &tool_calls)
+                {
                     yield Err(error);
                     return;
                 }
-            };
 
-            if (!assistant_text.is_empty() || !reasoning_content.is_empty() || !tool_calls.is_empty())
-                && let Err(error) =
-                    push_assistant_message(&state, assistant_text, reasoning_content, &tool_calls)
-            {
-                yield Err(error);
+                for tool_call in tool_calls {
+                    yield Ok(ModelEvent::ToolCall(tool_call));
+                }
+
                 return;
-            }
-
-            for tool_call in tool_calls {
-                yield Ok(ModelEvent::ToolCall(tool_call));
             }
         }))
     }
+}
+
+async fn send_openrouter_request(
+    http: &reqwest::Client,
+    endpoint: &str,
+    api_key: &str,
+    request: &ChatCompletionRequest,
+) -> Result<reqwest::Response, OpenRouterAttemptError> {
+    let response = http
+        .post(endpoint)
+        .headers(openrouter_headers(api_key))
+        .json(request)
+        .send()
+        .await
+        .map_err(|error| {
+            OpenRouterAttemptError::new(
+                format!("OpenRouter request failed: {error}"),
+                is_retryable_request_error(&error),
+                None,
+            )
+        })?;
+
+    if response.status().is_success() {
+        return Ok(response);
+    }
+
+    let status = response.status();
+    let retryable = is_retryable_status(status);
+    let retry_after = parse_retry_after(response.headers());
+    let message = match response.text().await {
+        Ok(body) => parse_openrouter_error(&body).unwrap_or_else(|| body.trim().to_string()),
+        Err(error) => format!("failed to read error body: {error}"),
+    };
+    let message = if message.is_empty() {
+        status
+            .canonical_reason()
+            .unwrap_or("no response body")
+            .to_string()
+    } else {
+        message
+    };
+
+    Err(OpenRouterAttemptError::new(
+        format!("OpenRouter request failed with HTTP {status}: {message}"),
+        retryable,
+        retry_after,
+    ))
+}
+
+fn should_retry_attempt(
+    error: &OpenRouterAttemptError,
+    attempt: usize,
+    max_attempts: usize,
+) -> bool {
+    error.retryable && attempt < max_attempts
+}
+
+async fn sleep_retry_delay(delay: Duration) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+fn is_retryable_request_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect()
+}
+
+fn is_retryable_stream_error(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_body()
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    headers
+        .get(RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 fn push_assistant_message(
@@ -511,15 +713,26 @@ fn parse_sse_line(line: &str) -> SseLine {
     }
 }
 
+#[cfg(test)]
 fn parse_chat_chunk(data: &str) -> Result<ChatChunkEvent, ModelError> {
-    let chunk = serde_json::from_str::<ChatCompletionChunk>(data)
-        .map_err(|error| ModelError::new(format!("failed to parse OpenRouter stream: {error}")))?;
+    parse_chat_chunk_attempt(data).map_err(OpenRouterAttemptError::into_model_error)
+}
+
+fn parse_chat_chunk_attempt(data: &str) -> Result<ChatChunkEvent, OpenRouterAttemptError> {
+    let chunk = serde_json::from_str::<ChatCompletionChunk>(data).map_err(|error| {
+        OpenRouterAttemptError::new(
+            format!("failed to parse OpenRouter stream: {error}"),
+            false,
+            None,
+        )
+    })?;
 
     if let Some(error) = chunk.error {
-        return Err(ModelError::new(format!(
-            "OpenRouter stream error: {}",
-            error.message
-        )));
+        return Err(OpenRouterAttemptError::new(
+            format!("OpenRouter stream error: {}", error.message),
+            error.is_retryable(),
+            None,
+        ));
     }
 
     // The final chunk carries usage accounting and typically has no choices.
@@ -960,7 +1173,51 @@ struct OpenRouterErrorResponse {
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterError {
+    code: Option<OpenRouterErrorCode>,
     message: String,
+}
+
+impl OpenRouterError {
+    fn is_retryable(&self) -> bool {
+        self.code
+            .as_ref()
+            .is_some_and(OpenRouterErrorCode::is_retryable)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OpenRouterErrorCode {
+    Number(u16),
+    Text(String),
+}
+
+impl OpenRouterErrorCode {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Number(code) => StatusCode::from_u16(*code)
+                .map(is_retryable_status)
+                .unwrap_or(false),
+            Self::Text(code) => {
+                if let Ok(code) = code.parse::<u16>() {
+                    return StatusCode::from_u16(code)
+                        .map(is_retryable_status)
+                        .unwrap_or(false);
+                }
+
+                matches!(
+                    code.as_str(),
+                    "provider_error"
+                        | "rate_limit_exceeded"
+                        | "request_timeout"
+                        | "server_error"
+                        | "temporarily_unavailable"
+                        | "timeout"
+                        | "upstream_error"
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1063,11 +1320,15 @@ mod tests {
     use futures_util::stream;
     use serde_json::json;
     use std::{
-        env, fs, process,
+        env, fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        process,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU64, Ordering},
         },
+        thread,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1746,6 +2007,134 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn openrouter_retries_http_500_then_streams_success() {
+        let server = TestServer::new(vec![
+            TestHttpResponse::json(500, r#"{"error":{"code":500,"message":"upstream down"}}"#),
+            TestHttpResponse::sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![Ok(ModelEvent::AssistantDelta {
+                text: "ok".to_string()
+            })]
+        );
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn openrouter_retries_http_429_retry_after_then_streams_success() {
+        let server = TestServer::new(vec![
+            TestHttpResponse::json(429, r#"{"error":{"code":429,"message":"rate limited"}}"#)
+                .with_header("Retry-After", "0"),
+            TestHttpResponse::sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![Ok(ModelEvent::AssistantDelta {
+                text: "ok".to_string()
+            })]
+        );
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn openrouter_does_not_retry_http_401() {
+        let server = TestServer::new(vec![TestHttpResponse::json(
+            401,
+            r#"{"error":{"code":401,"message":"Invalid API key"}}"#,
+        )]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![Err(ModelError::new(
+                "OpenRouter request failed with HTTP 401 Unauthorized: Invalid API key"
+            ))]
+        );
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn openrouter_retries_stream_error_before_visible_output() {
+        let server = TestServer::new(vec![
+            TestHttpResponse::sse(
+                "data: {\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+            ),
+            TestHttpResponse::sse(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n",
+            ),
+        ]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![Ok(ModelEvent::AssistantDelta {
+                text: "ok".to_string()
+            })]
+        );
+        assert_eq!(server.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn openrouter_does_not_retry_stream_error_after_visible_output() {
+        let server = TestServer::new(vec![TestHttpResponse::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"code\":\"server_error\",\"message\":\"Provider disconnected unexpectedly\"},\"choices\":[{\"delta\":{\"content\":\"\"},\"finish_reason\":\"error\"}]}\n\n",
+        )]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![
+                Ok(ModelEvent::AssistantDelta {
+                    text: "partial".to_string()
+                }),
+                Err(ModelError::new(
+                    "OpenRouter stream error: Provider disconnected unexpectedly"
+                ))
+            ]
+        );
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn openrouter_reports_exhausted_retries() {
+        let server = TestServer::new(vec![
+            TestHttpResponse::json(500, r#"{"error":{"code":500,"message":"upstream down"}}"#),
+            TestHttpResponse::json(500, r#"{"error":{"code":500,"message":"upstream down"}}"#),
+            TestHttpResponse::json(500, r#"{"error":{"code":500,"message":"upstream down"}}"#),
+        ]);
+        let mut client = openrouter_test_client(server.endpoint(), 3);
+
+        let results = collect_openrouter_turn(&mut client).await;
+
+        assert_eq!(
+            results,
+            vec![Err(ModelError::new(
+                "OpenRouter request failed after 3 attempts: OpenRouter request failed with HTTP 500 Internal Server Error: upstream down"
+            ))]
+        );
+        assert_eq!(server.request_count(), 3);
+    }
+
     #[derive(Clone)]
     struct ScriptedModel {
         response: Result<Vec<Result<ModelEvent, ModelError>>, ModelError>,
@@ -1847,6 +2236,197 @@ mod tests {
             Err(error) => assert_eq!(error, AgentError::UnsupportedOp { op: expected }),
             Ok(_) => panic!("expected unsupported op error"),
         }
+    }
+
+    fn openrouter_test_client(endpoint: &str, max_attempts: usize) -> OpenRouterClient {
+        OpenRouterClient::with_endpoint("test/model", "test-key", endpoint).with_retry_policy(
+            RetryPolicy {
+                max_attempts,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            },
+        )
+    }
+
+    async fn collect_openrouter_turn(
+        client: &mut OpenRouterClient,
+    ) -> Vec<Result<ModelEvent, ModelError>> {
+        let temp = TempDir::new();
+        client
+            .stream_turn(ModelTurnInput {
+                prompt: "say hello".to_string(),
+                cwd: temp.path().clone(),
+            })
+            .expect("openrouter stream")
+            .collect()
+            .await
+    }
+
+    struct TestServer {
+        endpoint: String,
+        request_count: Arc<AtomicU64>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn new(responses: Vec<TestHttpResponse>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+            listener
+                .set_nonblocking(true)
+                .expect("make test server nonblocking");
+            let endpoint = format!(
+                "http://{}/api/v1/chat/completions",
+                listener.local_addr().expect("test server address")
+            );
+            let request_count = Arc::new(AtomicU64::new(0));
+            let thread_request_count = Arc::clone(&request_count);
+            let handle = thread::spawn(move || {
+                for response in responses {
+                    let (mut stream, _) = accept_with_timeout(&listener);
+                    thread_request_count.fetch_add(1, Ordering::SeqCst);
+                    read_http_request(&mut stream);
+                    write_http_response(&mut stream, &response);
+                }
+            });
+
+            Self {
+                endpoint,
+                request_count,
+                handle: Some(handle),
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn request_count(&self) -> u64 {
+            self.request_count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                if thread::panicking() {
+                    let _ = handle.join();
+                } else {
+                    handle.join().expect("test server thread");
+                }
+            }
+        }
+    }
+
+    struct TestHttpResponse {
+        status: u16,
+        headers: Vec<(&'static str, &'static str)>,
+        body: &'static str,
+    }
+
+    impl TestHttpResponse {
+        fn json(status: u16, body: &'static str) -> Self {
+            Self {
+                status,
+                headers: vec![("Content-Type", "application/json")],
+                body,
+            }
+        }
+
+        fn sse(body: &'static str) -> Self {
+            Self {
+                status: 200,
+                headers: vec![("Content-Type", "text/event-stream")],
+                body,
+            }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    fn accept_with_timeout(listener: &TcpListener) -> (TcpStream, std::net::SocketAddr) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match listener.accept() {
+                Ok(accepted) => return accepted,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        panic!("timed out waiting for test request");
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept test request: {error}"),
+            }
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        let mut expected_len = None;
+
+        loop {
+            let read = stream.read(&mut buffer).expect("read test request");
+            if read == 0 {
+                break;
+            }
+
+            request.extend_from_slice(&buffer[..read]);
+
+            if expected_len.is_none()
+                && let Some(header_end) = find_header_end(&request)
+            {
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let body_len = parse_content_length(&headers);
+                expected_len = Some(header_end + 4 + body_len);
+            }
+
+            if expected_len.is_some_and(|len| request.len() >= len) {
+                break;
+            }
+        }
+    }
+
+    fn find_header_end(request: &[u8]) -> Option<usize> {
+        request.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    fn parse_content_length(headers: &str) -> usize {
+        headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0)
+    }
+
+    fn write_http_response(stream: &mut TcpStream, response: &TestHttpResponse) {
+        let reason = StatusCode::from_u16(response.status)
+            .ok()
+            .and_then(|status| status.canonical_reason())
+            .unwrap_or("OK");
+        let headers = response
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+
+        write!(
+            stream,
+            "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\
+             \r\n{}",
+            response.status,
+            reason,
+            response.body.len(),
+            headers,
+            response.body
+        )
+        .expect("write test response");
     }
 
     struct TempDir {
