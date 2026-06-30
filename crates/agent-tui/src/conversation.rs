@@ -124,7 +124,13 @@ pub(crate) struct Conversation {
     pub(crate) history_queue: Vec<HistoryLine>,
     /// Animation frame for the running-tool spinner.
     pub(crate) spinner_frame: usize,
+    /// Tick accumulator used to advance the spinner slower than the tick rate.
+    spinner_tick_acc: usize,
 }
+
+/// Number of `on_tick` ticks (each `COMMIT_TICK` apart) per spinner frame.
+/// Higher slows the spin; at a 50ms tick this yields ~150ms per frame.
+const SPINNER_TICKS_PER_FRAME: usize = 3;
 
 impl Conversation {
     pub(crate) fn new() -> Self {
@@ -196,7 +202,13 @@ impl Conversation {
     /// Advance the spinner and release one pending line per tick, pacing the
     /// scroll-in of finalized content.
     pub(crate) fn on_tick(&mut self) {
-        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        self.spinner_tick_acc = self.spinner_tick_acc.wrapping_add(1);
+        if self
+            .spinner_tick_acc
+            .is_multiple_of(SPINNER_TICKS_PER_FRAME)
+        {
+            self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        }
         self.commit_one_streaming_chunk();
     }
 

@@ -736,6 +736,7 @@ fn render_app(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),
+            Constraint::Length(app.status_height()),
             Constraint::Length(app.composer.height(area.width).max(3)),
             Constraint::Length(1),
         ])
@@ -743,9 +744,24 @@ fn render_app(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState
 
     frame.render_widget(Clear, area);
     render_live(frame, chunks[0], app);
-    render_composer(frame, chunks[1], app);
-    render_footer(frame, chunks[2], app);
-    frame.set_cursor_position(app.composer.cursor_position(chunks[1]));
+    render_status(frame, chunks[1], app);
+    render_composer(frame, chunks[2], app);
+    render_footer(frame, chunks[3], app);
+    frame.set_cursor_position(app.composer.cursor_position(chunks[2]));
+}
+
+/// Render the spinning "Thinking..." indicator that sits directly above the
+/// composer while a turn is in flight. Renders nothing when idle.
+fn render_status(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState) {
+    if !app.running {
+        return;
+    }
+    let spinner = SPINNER_FRAMES[app.log.spinner_frame % SPINNER_FRAMES.len()];
+    let line = Line::from(vec![
+        Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
+        Span::styled("Thinking...", Style::default().fg(Color::Gray)),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn history_style(kind: LineKind) -> Style {
@@ -852,10 +868,8 @@ fn render_composer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &App
 }
 
 fn render_footer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState) {
-    let mode = if app.running { "running" } else { "idle" };
     let text = format!(
-        "{} | {} | {} | {} | Enter submit | Ctrl+C quit",
-        mode,
+        "{} | {} | {} | Enter submit | Ctrl+C quit",
         app.model,
         app.cwd.display(),
         format_usage(&app.session_usage),
@@ -994,13 +1008,20 @@ impl AppState {
         (self.composer_text_width, self.composer_visible_rows)
     }
 
+    /// Height of the "Thinking..." status row above the composer: one row while
+    /// a turn is running, zero when idle.
+    fn status_height(&self) -> u16 {
+        u16::from(self.running)
+    }
+
     /// Compute how tall the viewport should be for this frame.
     fn desired_viewport_height(&self, width: u16, screen_height: u16) -> u16 {
         let composer_h = self.composer.height(width).max(3);
         let footer_h: u16 = 1;
+        let status_h = self.status_height();
         let live_h = self.live_content_height(width);
         let max_height = screen_height / 2;
-        (live_h + composer_h + footer_h).min(max_height)
+        (live_h + status_h + composer_h + footer_h).min(max_height)
     }
 
     /// Compute the number of terminal rows the live items would occupy at the
