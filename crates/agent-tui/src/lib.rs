@@ -73,7 +73,10 @@ where
     // terminals, matching the reference TUI's feature gate.
     let reflow_enabled = std::env::var_os("POE_TUI_RESIZE_REFLOW").is_some();
     let mut reflow = resize_reflow::ResizeReflowState::default();
-    reflow.init_width(terminal.screen_width());
+    {
+        let size = terminal.screen_size();
+        reflow.init_size(size.width, size.height);
+    }
 
     terminal.flush_welcome(&app)?;
     terminal.draw(&mut app)?;
@@ -110,8 +113,9 @@ where
 
         if reflow_enabled {
             let now = Instant::now();
-            reflow.observe(terminal.screen_width(), now);
-            if let Some(width) = reflow.take_due(now) {
+            let size = terminal.screen_size();
+            reflow.observe(size.width, size.height, now);
+            if let Some((width, _height)) = reflow.take_due(now) {
                 terminal.reflow_scrollback(&mut app, width)?;
             }
         }
@@ -399,20 +403,19 @@ impl InlineTerminal {
         Ok(())
     }
 
-    /// Current terminal width, or 0 if the backend cannot be probed.
-    fn screen_width(&self) -> u16 {
-        self.terminal.size().map(|size| size.width).unwrap_or(0)
+    /// Current terminal size, or a zero size if the backend cannot be probed.
+    fn screen_size(&self) -> Size {
+        self.terminal.size().unwrap_or(Size::new(0, 0))
     }
 
     /// Rebuild owned scrollback from retained conversation history at `width`,
     /// discarding the stale wrapping the terminal applied to already-emitted
-    /// rows after a width change.
+    /// rows after a width change and the row shifts a height change causes
+    /// around the viewport.
     ///
     /// Only the bottom-pinned (steady-state) regime is rebuilt: before the
     /// viewport fills the screen there is little scrollback above it and the
-    /// next normal draw re-wraps the live region anyway. The full retained
-    /// history is re-emitted without a row cap, so a very long session replays
-    /// everything here — a cap is future work.
+    /// next normal draw re-wraps the live region anyway.
     fn reflow_scrollback(&mut self, app: &mut AppState, width: u16) -> Result<(), TuiError> {
         if !self.terminal.is_bottom_pinned() {
             return Ok(());
@@ -434,15 +437,25 @@ impl InlineTerminal {
                 conversation::HistoryLine::dim(format!("… {dropped} earlier rows not reflowed …")),
             );
         }
+        // The replay reproduces every retained line, including those still
+        // queued for the incremental drip. Drop the queue so the next
+        // `flush_history` does not re-emit them on top of the replay.
+        app.log.clear_pending_history_queue();
+
+        // Place the viewport exactly where the next draw will, so the post-reflow
+        // draw is a no-op move and does not scroll the freshly replayed rows.
+        let size = self.terminal.size()?;
+        let height = app
+            .desired_viewport_height(width, size.height)
+            .min(size.height);
+        let area = Rect::new(0, size.height.saturating_sub(height), width, height);
+
         io::stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
-            let size = terminal.size()?;
-            let height = terminal.viewport_area.height.min(size.height);
-            let area = Rect::new(0, size.height.saturating_sub(height), width, height);
 
             // Take ownership of the screen: purge scrollback and clear the
             // visible screen, throwing away the terminal's own reflow of the
-            // old-width rows in favour of our source-backed replay.
+            // old rows in favour of our source-backed replay.
             let backend = terminal.backend_mut();
             crossterm::queue!(
                 backend,
@@ -451,7 +464,7 @@ impl InlineTerminal {
                 TerminalClear(ClearType::All),
             )?;
 
-            // Re-establish the viewport at the new width with empty scrollback
+            // Re-establish the viewport at the new size with empty scrollback
             // above it, then replay history through the normal insert path so
             // overflow scrolls back into terminal scrollback naturally. With no
             // rows above the viewport there is nowhere to replay into.

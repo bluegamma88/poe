@@ -232,6 +232,13 @@ impl Conversation {
         render_history_lines(&self.history_source, width)
     }
 
+    /// Discard the not-yet-flushed incremental queue. Its lines are also in
+    /// `history_source`, so after a full source-backed replay they would
+    /// otherwise be emitted a second time by the next `take_history_lines`.
+    pub(crate) fn clear_pending_history_queue(&mut self) {
+        self.history_queue.clear();
+    }
+
     /// Append streamed text to the trailing text item, shedding every completed
     /// line into `pending_lines` and leaving the partial line live.
     fn append_streaming_text(&mut self, text: &str, kind: LineKind) {
@@ -590,6 +597,22 @@ mod tests {
                 HistoryLine::normal("kl"),
             ]
         );
+    }
+
+    #[test]
+    fn clearing_pending_queue_prevents_replay_duplication() {
+        let mut conv = Conversation::new();
+        conv.start_turn("abcdef");
+        conv.push_assistant_delta("ghijkl");
+        conv.finalize_all();
+
+        // A reflow replays the full source, then drops the queue so the next
+        // incremental flush does not re-emit the same lines.
+        let _replayed = conv.render_history_lines(8);
+        conv.clear_pending_history_queue();
+        assert!(conv.take_history_lines(8).is_empty());
+        // The source is untouched, so it can still replay at any width.
+        assert_eq!(conv.render_history_lines(8).len(), 2);
     }
 
     #[test]
