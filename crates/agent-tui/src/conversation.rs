@@ -381,7 +381,10 @@ fn wrap_line(line: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn render_history_lines(lines: &[HistoryLine], width: usize) -> Vec<HistoryLine> {
+/// Wrap and pad a slice of logical history lines to `width`. Shared by the
+/// incremental drain, the source-backed replay, and resize reflow's
+/// re-rendering of out-of-band lines (e.g. the welcome box).
+pub(crate) fn render_history_lines(lines: &[HistoryLine], width: usize) -> Vec<HistoryLine> {
     let width = width.max(1);
     lines
         .iter()

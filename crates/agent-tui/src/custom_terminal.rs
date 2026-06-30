@@ -112,14 +112,15 @@ impl<B: Backend> Terminal<B> {
         self.visible_history_rows = self.visible_history_rows.min(area.top());
     }
 
-    /// Reset viewport bookkeeping to `area` with no visible history above it,
-    /// after the screen and scrollback have been purged for resize reflow.
-    /// Pins the viewport to the bottom regime and forces the next draw to fully
-    /// repaint the viewport.
-    pub fn reset_for_reflow(&mut self, area: Rect) {
-        self.bottom_pinned = true;
+    /// Reset viewport bookkeeping to `area` after the screen and scrollback
+    /// have been purged for resize reflow. `bottom_pinned` selects the regime
+    /// and `history_rows` records how many history rows sit above the viewport
+    /// (the bottom-pinned replay leaves this at 0 and lets the insert path
+    /// update it). Forces the next draw to fully repaint the viewport.
+    pub fn reset_for_reflow(&mut self, area: Rect, bottom_pinned: bool, history_rows: u16) {
+        self.bottom_pinned = bottom_pinned;
         self.set_viewport_area(area);
-        self.visible_history_rows = 0;
+        self.visible_history_rows = history_rows.min(area.top());
         self.invalidate_viewport();
     }
 
