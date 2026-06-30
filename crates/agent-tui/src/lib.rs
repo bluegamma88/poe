@@ -73,6 +73,11 @@ where
     let reflow_enabled = std::env::var("POE_TUI_RESIZE_REFLOW")
         .map(|value| value != "0")
         .unwrap_or(true);
+    let reflow_max_rows = resize_reflow::parse_max_rows(
+        std::env::var("POE_TUI_RESIZE_REFLOW_MAX_ROWS")
+            .ok()
+            .as_deref(),
+    );
     let mut reflow = resize_reflow::ResizeReflowState::default();
     {
         let size = terminal.screen_size();
@@ -117,7 +122,7 @@ where
             let size = terminal.screen_size();
             reflow.observe(size.width, size.height, now);
             if let Some((width, _height)) = reflow.take_due(now) {
-                terminal.reflow_scrollback(&mut app, width)?;
+                terminal.reflow_scrollback(&mut app, width, reflow_max_rows)?;
             }
         }
 
@@ -417,7 +422,12 @@ impl InlineTerminal {
     /// Handles both regimes. When history still fits above the viewport the
     /// rows are repainted in place and the viewport stays top-anchored;
     /// otherwise the viewport bottom-pins and overflow scrolls into scrollback.
-    fn reflow_scrollback(&mut self, app: &mut AppState, width: u16) -> Result<(), TuiError> {
+    fn reflow_scrollback(
+        &mut self,
+        app: &mut AppState,
+        width: u16,
+        max_rows: Option<usize>,
+    ) -> Result<(), TuiError> {
         let width = width.max(1);
 
         // Replay the persistent welcome box (flushed out-of-band, so not part of
@@ -430,11 +440,6 @@ impl InlineTerminal {
         // Cap replayed history rows to roughly what the terminal would retain,
         // dropping the oldest with a marker rather than silently truncating. The
         // welcome box is always kept.
-        let max_rows = resize_reflow::parse_max_rows(
-            std::env::var("POE_TUI_RESIZE_REFLOW_MAX_ROWS")
-                .ok()
-                .as_deref(),
-        );
         if let Some(cap) = max_rows.filter(|&cap| history.len() > cap) {
             let dropped = history.len() - cap;
             history.drain(0..dropped);
@@ -456,43 +461,9 @@ impl InlineTerminal {
         let height = app
             .desired_viewport_height(width, size.height)
             .min(size.height);
-        let rows = lines.len() as u16;
-        // Stay top-anchored while history still fits above the viewport and the
-        // session has not already latched into the bottom-pinned regime.
-        let top_anchored =
-            !self.terminal.is_bottom_pinned() && rows.saturating_add(height) <= size.height;
 
-        io::stdout().sync_update(|_| {
-            let terminal = &mut self.terminal;
-
-            // Take ownership of the screen: purge scrollback and clear the
-            // visible screen, throwing away the terminal's own reflow of the
-            // old rows in favour of our source-backed replay.
-            crossterm::queue!(
-                terminal.backend_mut(),
-                crossterm::cursor::MoveTo(0, 0),
-                TerminalClear(ClearType::Purge),
-                TerminalClear(ClearType::All),
-            )?;
-
-            if top_anchored {
-                // History fits on screen: paint it directly into the rows above
-                // a top-anchored viewport, no scrollback needed.
-                let area = Rect::new(0, rows, width, height);
-                history_insert::write_history_block(terminal.backend_mut(), 0, &lines, width)?;
-                terminal.reset_for_reflow(area, false, rows);
-            } else {
-                // Bottom-pin the viewport and replay history through the insert
-                // path so overflow scrolls into terminal scrollback naturally.
-                // With no rows above the viewport there is nowhere to replay into.
-                let area = Rect::new(0, size.height.saturating_sub(height), width, height);
-                terminal.reset_for_reflow(area, true, 0);
-                if area.top() > 0 {
-                    history_insert::insert_history_lines(terminal, &lines)?;
-                }
-            }
-            io::Result::Ok(())
-        })??;
+        io::stdout()
+            .sync_update(|_| replay_reflow(&mut self.terminal, &lines, width, height))??;
         Ok(())
     }
 
@@ -577,6 +548,53 @@ impl Drop for InlineTerminal {
         );
         let _ = disable_raw_mode();
     }
+}
+
+/// Purge owned scrollback and replay `lines` at the new size. The
+/// byte-emitting core of [`InlineTerminal::reflow_scrollback`], split out so it
+/// can be exercised against a capturing backend in tests.
+///
+/// When history still fits above the viewport the rows are painted in place and
+/// the viewport stays top-anchored; otherwise the viewport bottom-pins and the
+/// insert path scrolls overflow into terminal scrollback.
+fn replay_reflow<B>(
+    terminal: &mut custom_terminal::Terminal<B>,
+    lines: &[conversation::HistoryLine],
+    width: u16,
+    height: u16,
+) -> io::Result<()>
+where
+    B: ratatui::backend::Backend + io::Write,
+{
+    let size = terminal.size()?;
+    let rows = lines.len() as u16;
+    // Stay top-anchored while history still fits above the viewport and the
+    // session has not already latched into the bottom-pinned regime.
+    let top_anchored = !terminal.is_bottom_pinned() && rows.saturating_add(height) <= size.height;
+
+    // Take ownership of the screen: purge scrollback and clear the visible
+    // screen, throwing away the terminal's own reflow of the old rows in favour
+    // of our source-backed replay.
+    crossterm::queue!(
+        terminal.backend_mut(),
+        crossterm::cursor::MoveTo(0, 0),
+        TerminalClear(ClearType::Purge),
+        TerminalClear(ClearType::All),
+    )?;
+
+    if top_anchored {
+        let area = Rect::new(0, rows, width, height);
+        history_insert::write_history_block(terminal.backend_mut(), 0, lines, width)?;
+        terminal.reset_for_reflow(area, false, rows);
+    } else {
+        let area = Rect::new(0, size.height.saturating_sub(height), width, height);
+        terminal.reset_for_reflow(area, true, 0);
+        // With no rows above the viewport there is nowhere to replay into.
+        if area.top() > 0 {
+            history_insert::insert_history_lines(terminal, lines)?;
+        }
+    }
+    Ok(())
 }
 
 /// Scroll `count` rows immediately above `viewport_top` up into terminal
@@ -1397,6 +1415,57 @@ mod tests {
             terminal.backend().clear_calls,
             vec![(Position { x: 0, y: 4 }, ClearType::AfterCursor)]
         );
+    }
+
+    #[test]
+    fn replay_reflow_bottom_pins_and_purges_when_history_overflows() {
+        let backend = RecordingBackend::new(Size::new(20, 8));
+        let mut terminal = custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_bottom_pinned(true);
+        terminal.set_viewport_area(Rect::new(0, 3, 20, 5));
+
+        // Ten history rows cannot fit above a 5-row viewport on an 8-row screen,
+        // so the replay must bottom-pin and scroll overflow into scrollback.
+        let lines: Vec<HistoryLine> = (0..10)
+            .map(|i| HistoryLine::normal(format!("row{i:02}")))
+            .collect();
+
+        replay_reflow(&mut terminal, &lines, 20, 5).expect("reflow");
+
+        assert!(terminal.is_bottom_pinned());
+        assert_eq!(terminal.viewport_area, Rect::new(0, 3, 20, 5));
+
+        let out = String::from_utf8_lossy(&terminal.backend().writes);
+        assert!(out.contains("\x1b[3J"), "purges scrollback");
+        assert!(out.contains("\x1b[2J"), "clears the screen");
+        assert!(
+            out.contains("row00") && out.contains("row09"),
+            "replays rows"
+        );
+    }
+
+    #[test]
+    fn replay_reflow_stays_top_anchored_when_history_fits() {
+        let backend = RecordingBackend::new(Size::new(20, 12));
+        let mut terminal = custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_viewport_area(Rect::new(0, 2, 20, 3));
+
+        // Three history rows fit above a 3-row viewport on a 12-row screen, so
+        // the replay paints them in place and keeps the viewport top-anchored
+        // just below them.
+        let lines: Vec<HistoryLine> = (0..3)
+            .map(|i| HistoryLine::normal(format!("line{i}")))
+            .collect();
+
+        replay_reflow(&mut terminal, &lines, 20, 3).expect("reflow");
+
+        assert!(!terminal.is_bottom_pinned());
+        assert_eq!(terminal.viewport_area, Rect::new(0, 3, 20, 3));
+        assert_eq!(terminal.visible_history_rows(), 3);
+
+        let out = String::from_utf8_lossy(&terminal.backend().writes);
+        assert!(out.contains("\x1b[3J") && out.contains("\x1b[2J"));
+        assert!(out.contains("line0") && out.contains("line2"));
     }
 
     fn test_app() -> AppState {
