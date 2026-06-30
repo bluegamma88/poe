@@ -668,8 +668,7 @@ where
     let old_top = area.top();
     let new_top = size.height.saturating_sub(area.height);
     let width = area.width.max(1);
-    let lines = app.log.take_history_lines(width as usize);
-    let n = lines.len() as u16;
+    let mut lines = app.log.take_history_lines(width as usize);
     area.y = new_top;
 
     if new_top < old_top {
@@ -684,23 +683,29 @@ where
             terminal.clear_for_viewport_change(*area)?;
             terminal.set_viewport_area(*area);
         }
-    } else if n > new_top {
-        // SHRINK, but more lines than fit above the viewport (a bulk flush such
-        // as finalizing a whole turn). Fall back to the scroll-region insert;
-        // the brief gap does not matter for a one-shot bulk write.
-        if !lines.is_empty() {
-            history_insert::insert_history_lines(terminal, &lines)?;
-        }
-        if *area != terminal.viewport_area {
-            terminal.clear_for_viewport_change(*area)?;
-            terminal.set_viewport_area(*area);
-        }
     } else {
-        // SHRINK (common) — the viewport top descends by `shrink`. Lay the new
-        // history into the rows it vacates; scroll older history into scrollback
-        // only for any overflow above, and pull history down to fill rows the
-        // shrink frees beyond the new lines. The history already on screen above
-        // is left untouched, so no gap appears.
+        // SHRINK — the viewport top descends. Only `new_top` history rows fit
+        // above the new viewport. When more lines were flushed at once (e.g.
+        // finalizing a whole turn produces a backlog larger than the rows above
+        // the shrunken viewport), push the oldest overflow into scrollback
+        // first — bottom-aligned to the *old* top, where the region above the
+        // viewport is still full of history — so the remaining lines can be laid
+        // flush against the new top below. The previous bulk-shrink shortcut
+        // instead inserted everything above the old top and then moved the
+        // viewport down, leaving a blank gap above the composer.
+        let n = lines.len() as u16;
+        if n > new_top {
+            let overflow = (n - new_top) as usize;
+            history_insert::insert_history_lines(terminal, &lines[..overflow])?;
+            lines.drain(..overflow);
+        }
+
+        // At most `new_top` lines remain. Lay them into the rows the shrink
+        // vacates, scrolling older on-screen history into scrollback for any
+        // overflow above, and pulling history down to fill rows the shrink frees
+        // beyond the new lines. History already on screen above is left
+        // untouched, so no gap appears.
+        let n = lines.len() as u16;
         let shrink = new_top - old_top;
         let above = n.saturating_sub(shrink);
         let pulldown = shrink.saturating_sub(n);
@@ -1466,6 +1471,41 @@ mod tests {
         let out = String::from_utf8_lossy(&terminal.backend().writes);
         assert!(out.contains("\x1b[3J") && out.contains("\x1b[2J"));
         assert!(out.contains("line0") && out.contains("line2"));
+    }
+
+    #[test]
+    fn bottom_pinned_bulk_shrink_bottom_aligns_history() {
+        // A whole turn finalized at once floods the queue with more lines than
+        // fit above the shrunken viewport (n > new_top). The history must end
+        // flush against the new viewport top, leaving no blank gap above the
+        // composer — the new viewport is cleared at its own top (y = 8), not at
+        // the old top (y = 2).
+        let backend = RecordingBackend::new(Size::new(20, 12));
+        let mut terminal = custom_terminal::Terminal::with_options(backend).expect("terminal");
+        terminal.set_bottom_pinned(true);
+        terminal.set_viewport_area(Rect::new(0, 2, 20, 10));
+
+        let mut app = test_app();
+        app.log.start_turn("hello"); // one user line: "> hello"
+        let body: String = (0..14).map(|i| format!("line{i}\n")).collect();
+        app.log.push_assistant_delta(&body); // 14 finalized lines
+        app.log.finalize_all(); // 15 lines queued, > new_top (8)
+
+        let mut area = terminal.viewport_area;
+        area.height = 4; // shrink: new_top = 12 - 4 = 8
+        reconcile_bottom_pinned(&mut terminal, &mut area, Size::new(20, 12), &mut app)
+            .expect("reconcile");
+
+        assert_eq!(terminal.viewport_area, Rect::new(0, 8, 20, 4));
+        assert_eq!(
+            terminal.backend().clear_calls,
+            vec![(Position { x: 0, y: 8 }, ClearType::AfterCursor)]
+        );
+        // The newest line is replayed (the block is written flush to the new top)
+        // and the oldest overflow lines still reach scrollback.
+        let out = String::from_utf8_lossy(&terminal.backend().writes);
+        assert!(out.contains("line13"), "newest line painted");
+        assert!(out.contains("line0"), "oldest overflow still emitted");
     }
 
     fn test_app() -> AppState {
