@@ -409,10 +409,9 @@ A minimal path would be:
 
 ## Implementation Status (Poe)
 
-Poe has since implemented source-backed scrollback reflow, gated behind the
-`POE_TUI_RESIZE_REFLOW` environment variable until verified across terminals
-(mirroring the reference's `TerminalResizeReflow` feature gate). Status against
-the gaps enumerated above:
+Poe has since implemented source-backed scrollback reflow. It is on by default;
+set `POE_TUI_RESIZE_REFLOW=0` to opt out if a terminal mishandles the replay.
+Status against the gaps enumerated above:
 
 1. **Source-backed transcript scrollback — done.** `Conversation` retains
    finalized logical lines in `history_source`; `render_history_lines(width)`
@@ -452,6 +451,5 @@ The reference supports resizing at two levels:
 
 Poe has the immediate viewport resizing layer and now also has the retained
 transcript and source-backed replay machinery, making previously emitted
-scrollback width- and height-resize aware. The replay is gated behind
-`POE_TUI_RESIZE_REFLOW` pending cross-terminal verification before it becomes
-the default.
+scrollback width- and height-resize aware. The replay is on by default, with
+`POE_TUI_RESIZE_REFLOW=0` as an opt-out escape hatch.

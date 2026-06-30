@@ -68,10 +68,11 @@ where
     let mut tick = time::interval(COMMIT_TICK);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    // Source-backed scrollback reflow on terminal resize. Off by default; the
-    // replay path rewrites owned scrollback and is opt-in until verified across
-    // terminals, matching the reference TUI's feature gate.
-    let reflow_enabled = std::env::var_os("POE_TUI_RESIZE_REFLOW").is_some();
+    // Source-backed scrollback reflow on terminal resize, on by default. Set
+    // POE_TUI_RESIZE_REFLOW=0 to opt out if a terminal mishandles the replay.
+    let reflow_enabled = std::env::var("POE_TUI_RESIZE_REFLOW")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let mut reflow = resize_reflow::ResizeReflowState::default();
     {
         let size = terminal.screen_size();
