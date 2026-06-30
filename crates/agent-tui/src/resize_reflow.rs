@@ -16,6 +16,25 @@ use std::time::{Duration, Instant};
 /// scrollback at every intermediate width.
 const DEBOUNCE: Duration = Duration::from_millis(75);
 
+/// Default cap on rendered rows replayed during reflow. Approximates common
+/// terminal scrollback retention so a long session does not reformat unbounded
+/// history the terminal would not have kept anyway.
+const DEFAULT_MAX_REFLOW_ROWS: usize = 10_000;
+
+/// Resolve the row cap from `POE_TUI_RESIZE_REFLOW_MAX_ROWS`:
+/// unset or unparseable -> [`DEFAULT_MAX_REFLOW_ROWS`]; `0` -> no cap (replay
+/// every retained row); a positive number -> that many rows.
+pub(crate) fn parse_max_rows(raw: Option<&str>) -> Option<usize> {
+    match raw {
+        None => Some(DEFAULT_MAX_REFLOW_ROWS),
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => None,
+            Ok(rows) => Some(rows),
+            Err(_) => Some(DEFAULT_MAX_REFLOW_ROWS),
+        },
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ResizeReflowState {
     /// Width scrollback was last rebuilt at. `None` until seeded.
@@ -128,6 +147,19 @@ mod tests {
         // Width snaps back to the baseline before the debounce elapses.
         state.observe(80, at(now, 20));
         assert_eq!(state.take_due(at(now, 200)), None);
+    }
+
+    #[test]
+    fn max_rows_parses_env_overrides() {
+        assert_eq!(parse_max_rows(None), Some(DEFAULT_MAX_REFLOW_ROWS));
+        assert_eq!(parse_max_rows(Some("0")), None);
+        assert_eq!(parse_max_rows(Some("500")), Some(500));
+        assert_eq!(parse_max_rows(Some("  42 ")), Some(42));
+        // Garbage falls back to the default rather than disabling the cap.
+        assert_eq!(
+            parse_max_rows(Some("nonsense")),
+            Some(DEFAULT_MAX_REFLOW_ROWS)
+        );
     }
 
     #[test]

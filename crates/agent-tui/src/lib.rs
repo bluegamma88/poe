@@ -418,7 +418,22 @@ impl InlineTerminal {
             return Ok(());
         }
         let width = width.max(1);
-        let lines = app.log.render_history_lines(width as usize);
+        let mut lines = app.log.render_history_lines(width as usize);
+        // Cap replayed rows to roughly what the terminal would retain, dropping
+        // the oldest rows with a marker rather than silently truncating.
+        let max_rows = resize_reflow::parse_max_rows(
+            std::env::var("POE_TUI_RESIZE_REFLOW_MAX_ROWS")
+                .ok()
+                .as_deref(),
+        );
+        if let Some(cap) = max_rows.filter(|&cap| lines.len() > cap) {
+            let dropped = lines.len() - cap;
+            lines.drain(0..dropped);
+            lines.insert(
+                0,
+                conversation::HistoryLine::dim(format!("… {dropped} earlier rows not reflowed …")),
+            );
+        }
         io::stdout().sync_update(|_| {
             let terminal = &mut self.terminal;
             let size = terminal.size()?;
