@@ -616,6 +616,42 @@ mod tests {
     }
 
     #[test]
+    fn reflow_midstream_neither_drops_nor_duplicates_lines() {
+        // A resize that fires mid-stream must not lose already-emitted lines or
+        // re-emit them. Because every stage holds logical (unwrapped) lines and
+        // wraps only at render time, the source stays authoritative throughout.
+        let mut conv = Conversation::new();
+        conv.start_turn("hello");
+        conv.push_assistant_delta("a\nb\nc\n");
+
+        // Drip two lines and "flush" them at the old width.
+        conv.commit_one_streaming_chunk();
+        conv.commit_one_streaming_chunk();
+        let _flushed_old = conv.take_history_lines(80);
+
+        // Reflow mid-stream: replay the source at the new width, drop the queue.
+        let replay: Vec<String> = conv
+            .render_history_lines(80)
+            .iter()
+            .map(|line| line.text.trim_end().to_string())
+            .collect();
+        conv.clear_pending_history_queue();
+        assert_eq!(replay, vec!["> hello", "a", "b"]);
+
+        // Streaming continues; the remaining lines drip and finalize normally.
+        conv.commit_one_streaming_chunk();
+        conv.push_assistant_delta("d\n");
+        conv.finalize_all();
+
+        let final_lines: Vec<String> = conv
+            .render_history_lines(80)
+            .iter()
+            .map(|line| line.text.trim_end().to_string())
+            .collect();
+        assert_eq!(final_lines, vec!["> hello", "a", "b", "c", "d"]);
+    }
+
+    #[test]
     fn multiline_user_prompt_echo_splits_explicit_newlines() {
         let mut conv = Conversation::new();
 
