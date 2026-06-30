@@ -407,6 +407,38 @@ A minimal path would be:
    Without a cap, drag-resizing a terminal during a long session could repeatedly
    format and replay thousands of rows.
 
+## Implementation Status (Poe)
+
+Poe has since implemented source-backed scrollback reflow, gated behind the
+`POE_TUI_RESIZE_REFLOW` environment variable until verified across terminals
+(mirroring the reference's `TerminalResizeReflow` feature gate). Status against
+the gaps enumerated above:
+
+1. **Source-backed transcript scrollback — done.** `Conversation` retains
+   finalized logical lines in `history_source`; `render_history_lines(width)`
+   replays them at any width.
+2. **Resize-reflow scheduler — done.** `ResizeReflowState` tracks observed size
+   and debounces (75 ms) so a drag collapses into one reflow once the size
+   settles. It schedules on both width and height changes.
+3. **Scrollback clear-and-replay — done.** `InlineTerminal::reflow_scrollback`
+   purges owned scrollback, re-renders the welcome box and retained history at
+   the new width, and replays them — top-anchored in place when history fits,
+   otherwise bottom-pinned with overflow scrolled into scrollback. The pending
+   incremental queue is dropped to avoid double-emission.
+4. **Cursor-position resize heuristic — superseded.** The reference uses this in
+   its *legacy* draw path. Poe's reflow path places the viewport deterministically
+   from screen size, exactly as the reference's own resize-reflow path does, so
+   the cursor-delta offset is unnecessary (and would double-correct).
+5. **Active stream rewrap — unnecessary by construction.** Every Poe stage holds
+   logical (unwrapped) lines and wraps only at render time, and live items
+   re-render each frame, so a mid-stream resize neither drops nor duplicates
+   content. No separate streaming controller is required.
+6. **Row cap policy — done.** `POE_TUI_RESIZE_REFLOW_MAX_ROWS` caps replayed
+   rows (default ~10k; `0` disables), with a marker line for dropped rows.
+
+Pre-render size sampling is handled by loop ordering: the scheduler observes
+terminal size before the draw updates `last_known_screen_size`.
+
 ## Bottom Line
 
 The reference supports resizing at two levels:
@@ -418,6 +450,8 @@ The reference supports resizing at two levels:
   rebuild that clears Codex-owned terminal history and replays transcript cells
   at the new width and height context.
 
-Poe currently has the immediate viewport resizing layer. It does not yet have
-the retained transcript and replay machinery needed to make previously emitted
-scrollback fully width- and height-resize aware.
+Poe has the immediate viewport resizing layer and now also has the retained
+transcript and source-backed replay machinery, making previously emitted
+scrollback width- and height-resize aware. The replay is gated behind
+`POE_TUI_RESIZE_REFLOW` pending cross-terminal verification before it becomes
+the default.
