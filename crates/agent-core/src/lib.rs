@@ -438,16 +438,22 @@ impl OpenRouterClient {
                 reasoning: ReasoningConfig { enabled: true },
             };
             let max_attempts = retry_policy.max_attempts();
+            // Debug fault injection: force the first N attempts of every request
+            // to fail with a retryable error so the retry path (and the TUI's
+            // "Retrying (n/m)…" status) can be exercised without a real outage.
+            let forced_failures = debug_forced_retry_failures();
 
             'attempts: for attempt in 1..=max_attempts {
-                let response = match send_openrouter_request(
-                    &http,
-                    &endpoint,
-                    &api_key,
-                    &request,
-                )
-                .await
-                {
+                let attempt_result = if attempt <= forced_failures {
+                    Err(OpenRouterAttemptError::new(
+                        "debug forced retry (POE_DEBUG_FORCE_RETRY)",
+                        true,
+                        None,
+                    ))
+                } else {
+                    send_openrouter_request(&http, &endpoint, &api_key, &request).await
+                };
+                let response = match attempt_result {
                     Ok(response) => response,
                     Err(error) => {
                         if should_retry_attempt(&error, attempt, max_attempts) {
@@ -647,6 +653,16 @@ fn should_retry_attempt(
     max_attempts: usize,
 ) -> bool {
     error.retryable && attempt < max_attempts
+}
+
+/// Number of initial attempts to force-fail per request, read from the
+/// `POE_DEBUG_FORCE_RETRY` environment variable (unset/invalid → 0). A debug
+/// aid for exercising the retry path and its "Retrying (n/m)…" status.
+fn debug_forced_retry_failures() -> usize {
+    std::env::var("POE_DEBUG_FORCE_RETRY")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 async fn sleep_retry_delay(delay: Duration) {
