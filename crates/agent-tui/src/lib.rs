@@ -766,8 +766,8 @@ fn render_status(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppSt
     }
     let spinner = SPINNER_FRAMES[app.log.spinner_frame % SPINNER_FRAMES.len()];
     let (label, label_style) = match app.retry {
-        Some((attempt, max_attempts)) => (
-            format!("Retrying ({attempt}/{max_attempts})..."),
+        Some((retry, max_retries)) => (
+            format!("Retrying ({retry}/{max_retries})..."),
             Style::default().fg(Color::Yellow),
         ),
         None => ("Thinking...".to_string(), Style::default().fg(Color::Gray)),
@@ -934,7 +934,7 @@ pub struct AppState {
     session_usage: TokenUsage,
     composer_text_width: u16,
     composer_visible_rows: u16,
-    /// When a model request is being retried, the (upcoming attempt, total)
+    /// When a model request is being retried, the (retry number, max retries)
     /// pair driving the "Retrying (n/m)…" status. Cleared once the request
     /// makes progress again or the turn ends.
     retry: Option<(usize, usize)>,
@@ -967,10 +967,7 @@ impl AppState {
         }
         match event {
             Event::SessionStarted => {}
-            Event::Retrying {
-                attempt,
-                max_attempts,
-            } => self.retry = Some((attempt, max_attempts)),
+            Event::Retrying { retry, max_retries } => self.retry = Some((retry, max_retries)),
             Event::AssistantDelta { text } => self.log.push_assistant_delta(&text),
             Event::ThinkingDelta { text } => self.log.push_thinking_delta(&text),
             Event::ToolStarted { call } => self.log.start_tool(call),
@@ -1354,10 +1351,10 @@ mod tests {
         app.running = true;
 
         app.apply_event(Event::Retrying {
-            attempt: 2,
-            max_attempts: 3,
+            retry: 1,
+            max_retries: 2,
         });
-        assert_eq!(app.retry, Some((2, 3)));
+        assert_eq!(app.retry, Some((1, 2)));
 
         // The next streamed content means the retry succeeded; the indicator
         // reverts to the normal "Thinking..." state.
