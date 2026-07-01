@@ -57,6 +57,10 @@ pub enum Event {
     TurnInterrupted,
     /// The current turn failed with a user-visible message.
     TurnFailed { message: String },
+    /// A model request failed and is being retried. `attempt` is the 1-based
+    /// number of the upcoming attempt (e.g. `2` after the first attempt failed)
+    /// out of `max_attempts` total.
+    Retrying { attempt: usize, max_attempts: usize },
     /// Token and cost accounting for one completed model request. The agent
     /// loop emits one of these per request (i.e. per tool round), so frontends
     /// accumulate them for session totals.

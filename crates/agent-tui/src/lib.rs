@@ -765,9 +765,16 @@ fn render_status(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppSt
         return;
     }
     let spinner = SPINNER_FRAMES[app.log.spinner_frame % SPINNER_FRAMES.len()];
+    let (label, label_style) = match app.retry {
+        Some((attempt, max_attempts)) => (
+            format!("Retrying ({attempt}/{max_attempts})..."),
+            Style::default().fg(Color::Yellow),
+        ),
+        None => ("Thinking...".to_string(), Style::default().fg(Color::Gray)),
+    };
     let line = Line::from(vec![
         Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
-        Span::styled("Thinking...", Style::default().fg(Color::Gray)),
+        Span::styled(label, label_style),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -927,6 +934,10 @@ pub struct AppState {
     session_usage: TokenUsage,
     composer_text_width: u16,
     composer_visible_rows: u16,
+    /// When a model request is being retried, the (upcoming attempt, total)
+    /// pair driving the "Retrying (n/m)…" status. Cleared once the request
+    /// makes progress again or the turn ends.
+    retry: Option<(usize, usize)>,
 }
 
 impl AppState {
@@ -944,12 +955,22 @@ impl AppState {
             session_usage: TokenUsage::default(),
             composer_text_width: 78,
             composer_visible_rows: 1,
+            retry: None,
         }
     }
 
     pub fn apply_event(&mut self, event: Event) {
+        // Any event other than a fresh retry signal means the request is making
+        // progress (or the turn ended), so drop a pending retry indicator.
+        if !matches!(event, Event::Retrying { .. }) {
+            self.retry = None;
+        }
         match event {
             Event::SessionStarted => {}
+            Event::Retrying {
+                attempt,
+                max_attempts,
+            } => self.retry = Some((attempt, max_attempts)),
             Event::AssistantDelta { text } => self.log.push_assistant_delta(&text),
             Event::ThinkingDelta { text } => self.log.push_thinking_delta(&text),
             Event::ToolStarted { call } => self.log.start_tool(call),
@@ -987,6 +1008,7 @@ impl AppState {
     pub fn start_turn(&mut self, prompt: &str) {
         self.running = true;
         self.scroll_offset = 0;
+        self.retry = None;
         self.log.start_turn(prompt);
     }
 
@@ -1324,6 +1346,25 @@ mod tests {
         assert_eq!(humanize_tokens(940), "940");
         assert_eq!(humanize_tokens(12_400), "12.4k");
         assert_eq!(humanize_tokens(3_000_000), "3.0M");
+    }
+
+    #[test]
+    fn retry_event_sets_indicator_and_progress_clears_it() {
+        let mut app = test_app();
+        app.running = true;
+
+        app.apply_event(Event::Retrying {
+            attempt: 2,
+            max_attempts: 3,
+        });
+        assert_eq!(app.retry, Some((2, 3)));
+
+        // The next streamed content means the retry succeeded; the indicator
+        // reverts to the normal "Thinking..." state.
+        app.apply_event(Event::AssistantDelta {
+            text: "hello".to_string(),
+        });
+        assert_eq!(app.retry, None);
     }
 
     #[test]

@@ -471,6 +471,8 @@ impl ScriptedModel {
                 ModelEvent::ThinkingDelta { text } => reasoning_content.push_str(text),
                 // Usage accounting is not part of the persisted assistant message.
                 ModelEvent::Usage(_) => {}
+                // Retry signals are transient UI state, not persisted content.
+                ModelEvent::Retrying { .. } => {}
                 ModelEvent::ToolCall(call) => tool_calls.push(ToolCall {
                     id: call.id.clone(),
                     name: call.name.clone(),

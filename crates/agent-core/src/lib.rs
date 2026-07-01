@@ -134,6 +134,15 @@ where
                                 Ok(ModelEvent::Usage(usage)) => {
                                     yield Event::Usage { usage };
                                 }
+                                Ok(ModelEvent::Retrying {
+                                    attempt,
+                                    max_attempts,
+                                }) => {
+                                    yield Event::Retrying {
+                                        attempt,
+                                        max_attempts,
+                                    };
+                                }
                                 Ok(ModelEvent::ToolCall(tool_call)) => {
                                     yield Event::ToolStarted {
                                         call: ToolCall {
@@ -443,6 +452,10 @@ impl OpenRouterClient {
                     Err(error) => {
                         if should_retry_attempt(&error, attempt, max_attempts) {
                             let delay = retry_policy.retry_delay(attempt, error.retry_after);
+                            yield Ok(ModelEvent::Retrying {
+                                attempt: attempt + 1,
+                                max_attempts,
+                            });
                             sleep_retry_delay(delay).await;
                             continue 'attempts;
                         }
@@ -477,6 +490,10 @@ impl OpenRouterClient {
                             if !emitted_event && should_retry_attempt(&error, attempt, max_attempts)
                             {
                                 let delay = retry_policy.retry_delay(attempt, error.retry_after);
+                                yield Ok(ModelEvent::Retrying {
+                                    attempt: attempt + 1,
+                                    max_attempts,
+                                });
                                 sleep_retry_delay(delay).await;
                                 continue 'attempts;
                             }
@@ -527,6 +544,10 @@ impl OpenRouterClient {
                                     {
                                         let delay =
                                             retry_policy.retry_delay(attempt, error.retry_after);
+                                        yield Ok(ModelEvent::Retrying {
+                                            attempt: attempt + 1,
+                                            max_attempts,
+                                        });
                                         sleep_retry_delay(delay).await;
                                         continue 'attempts;
                                     }
@@ -1233,6 +1254,9 @@ pub enum ModelEvent {
     ThinkingDelta { text: String },
     ToolCall(ModelToolCall),
     Usage(TokenUsage),
+    /// A request failed and is being retried. `attempt` is the 1-based number
+    /// of the upcoming attempt out of `max_attempts` total.
+    Retrying { attempt: usize, max_attempts: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1507,6 +1531,43 @@ mod tests {
         assert_eq!(
             second_events,
             vec![
+                Event::AssistantDelta {
+                    text: "ok".to_string()
+                },
+                Event::TurnComplete
+            ]
+        );
+    }
+
+    #[test]
+    fn retry_model_events_are_bridged_to_retrying_events() {
+        let mut session = AgentSession::new(ScriptedModel::success(vec![
+            ModelEvent::Retrying {
+                attempt: 2,
+                max_attempts: 3,
+            },
+            ModelEvent::AssistantDelta {
+                text: "ok".to_string(),
+            },
+        ]));
+
+        let events = submit_events(
+            &mut session,
+            Op::UserTurn {
+                prompt: "say hello".to_string(),
+                cwd: PathBuf::from("/tmp/project"),
+            },
+            "submit user turn",
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                Event::SessionStarted,
+                Event::Retrying {
+                    attempt: 2,
+                    max_attempts: 3
+                },
                 Event::AssistantDelta {
                     text: "ok".to_string()
                 },
@@ -2021,9 +2082,15 @@ mod tests {
 
         assert_eq!(
             results,
-            vec![Ok(ModelEvent::AssistantDelta {
-                text: "ok".to_string()
-            })]
+            vec![
+                Ok(ModelEvent::Retrying {
+                    attempt: 2,
+                    max_attempts: 3
+                }),
+                Ok(ModelEvent::AssistantDelta {
+                    text: "ok".to_string()
+                })
+            ]
         );
         assert_eq!(server.request_count(), 2);
     }
@@ -2043,9 +2110,15 @@ mod tests {
 
         assert_eq!(
             results,
-            vec![Ok(ModelEvent::AssistantDelta {
-                text: "ok".to_string()
-            })]
+            vec![
+                Ok(ModelEvent::Retrying {
+                    attempt: 2,
+                    max_attempts: 3
+                }),
+                Ok(ModelEvent::AssistantDelta {
+                    text: "ok".to_string()
+                })
+            ]
         );
         assert_eq!(server.request_count(), 2);
     }
@@ -2085,9 +2158,15 @@ mod tests {
 
         assert_eq!(
             results,
-            vec![Ok(ModelEvent::AssistantDelta {
-                text: "ok".to_string()
-            })]
+            vec![
+                Ok(ModelEvent::Retrying {
+                    attempt: 2,
+                    max_attempts: 3
+                }),
+                Ok(ModelEvent::AssistantDelta {
+                    text: "ok".to_string()
+                })
+            ]
         );
         assert_eq!(server.request_count(), 2);
     }
@@ -2128,9 +2207,19 @@ mod tests {
 
         assert_eq!(
             results,
-            vec![Err(ModelError::new(
-                "OpenRouter request failed after 3 attempts: OpenRouter request failed with HTTP 500 Internal Server Error: upstream down"
-            ))]
+            vec![
+                Ok(ModelEvent::Retrying {
+                    attempt: 2,
+                    max_attempts: 3
+                }),
+                Ok(ModelEvent::Retrying {
+                    attempt: 3,
+                    max_attempts: 3
+                }),
+                Err(ModelError::new(
+                    "OpenRouter request failed after 3 attempts: OpenRouter request failed with HTTP 500 Internal Server Error: upstream down"
+                ))
+            ]
         );
         assert_eq!(server.request_count(), 3);
     }
