@@ -848,7 +848,9 @@ fn welcome_history_lines(app: &AppState) -> Vec<conversation::HistoryLine> {
 
 fn render_composer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState) {
     frame.render_widget(
-        Block::default().borders(Borders::TOP | Borders::BOTTOM),
+        Block::default()
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::Gray)),
         area,
     );
 
@@ -871,7 +873,7 @@ fn render_composer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &App
         Rect::new(text_area.x - prefix_width, text_area.y, prefix_width, 1),
     );
 
-    let paragraph = Paragraph::new(lines);
+    let paragraph = Paragraph::new(lines).style(Style::default().fg(Color::White));
     frame.render_widget(paragraph, text_area);
 }
 
