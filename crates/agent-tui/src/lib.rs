@@ -216,7 +216,15 @@ where
             Ok(false)
         }
         KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
+            // Insert a newline instead of submitting. Shift+Enter only reaches us
+            // on terminals that speak the Kitty keyboard protocol (enabled via
+            // DISAMBIGUATE_ESCAPE_CODES); elsewhere it is byte-identical to a bare
+            // Enter. Alt/Option+Enter is delivered as Enter+ALT on essentially
+            // every terminal, so it serves as the portable fallback.
+            if key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+            {
                 app.composer.insert_char('\n');
                 return Ok(false);
             }
@@ -869,7 +877,7 @@ fn render_composer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &App
 
 fn render_footer(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppState) {
     let text = format!(
-        "{} | {} | {} | Enter submit | Ctrl+C quit",
+        "{} | {} | {}",
         app.model,
         app.cwd.display(),
         format_usage(&app.session_usage),
@@ -1374,6 +1382,31 @@ mod tests {
 
         assert!(!should_quit);
         assert_eq!(app.composer.text(), "hello");
+    }
+
+    #[tokio::test]
+    async fn shift_and_alt_enter_insert_newline_without_submitting() {
+        for modifier in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            let mut app = test_app();
+            let mut session = AgentSession::new(NoopModel);
+            let mut current_stream = None;
+
+            app.composer.insert_text("line1");
+            let should_quit = handle_key(
+                KeyEvent::new(KeyCode::Enter, modifier),
+                &mut app,
+                &mut session,
+                &mut current_stream,
+            )
+            .await
+            .expect("handle key");
+
+            assert!(!should_quit);
+            assert_eq!(app.composer.text(), "line1\n");
+            // The turn must not have started: no stream, composer untouched.
+            assert!(current_stream.is_none());
+            assert!(!app.running);
+        }
     }
 
     #[tokio::test]
