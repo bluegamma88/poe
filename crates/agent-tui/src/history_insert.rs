@@ -204,6 +204,8 @@ fn style_for_kind(kind: LineKind) -> (Color, Color) {
         LineKind::Normal => (Color::White, Color::Reset),
         LineKind::Thinking => (Color::Gray, Color::Reset),
         LineKind::Dim => (Color::DarkGray, Color::Reset),
+        LineKind::Success => (Color::Green, Color::Reset),
+        LineKind::Error => (Color::Red, Color::Reset),
         LineKind::User => (Color::White, Color::Indexed(238)),
     }
 }

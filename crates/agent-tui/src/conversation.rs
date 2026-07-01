@@ -22,9 +22,11 @@
 //! `InlineTerminal` decides *how* it reaches the screen. The run loop wires the
 //! two together.
 
+use std::path::{Path, PathBuf};
+
 use agent_protocol::{ToolCall, ToolResult};
 
-use crate::{describe_tool_call, describe_tool_result};
+use crate::describe_tool_call;
 
 const TOOL_OUTPUT_TAIL_LINES: usize = 3;
 
@@ -34,6 +36,10 @@ pub(crate) enum LineKind {
     Normal,
     Thinking,
     Dim,
+    /// A finished tool call that succeeded (green header).
+    Success,
+    /// A finished tool call that failed or was interrupted (red header/status).
+    Error,
     /// The echoed user prompt. Rendered on a filled background, padded to the
     /// full width, to set it apart from assistant output.
     User,
@@ -65,6 +71,20 @@ impl HistoryLine {
         Self {
             text: text.into(),
             kind: LineKind::Dim,
+        }
+    }
+
+    pub(crate) fn success(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: LineKind::Success,
+        }
+    }
+
+    pub(crate) fn error(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            kind: LineKind::Error,
         }
     }
 
@@ -126,6 +146,9 @@ pub(crate) struct Conversation {
     pub(crate) spinner_frame: usize,
     /// Tick accumulator used to advance the spinner slower than the tick rate.
     spinner_tick_acc: usize,
+    /// Working directory used to relativize tool-call paths for display. Empty
+    /// (the default) leaves paths absolute.
+    cwd: PathBuf,
 }
 
 /// Number of `on_tick` ticks (each `COMMIT_TICK` apart) per spinner frame.
@@ -135,6 +158,11 @@ const SPINNER_TICKS_PER_FRAME: usize = 3;
 impl Conversation {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the directory used to relativize tool-call paths when rendering.
+    pub(crate) fn set_cwd(&mut self, cwd: PathBuf) {
+        self.cwd = cwd;
     }
 
     /// Reset the transient zone for a new turn and echo the user's prompt.
@@ -224,7 +252,8 @@ impl Conversation {
     pub(crate) fn finalize_all(&mut self) {
         self.finalize_trailing_text();
         for item in std::mem::take(&mut self.live) {
-            self.pending_lines.extend(item_history_lines(&item));
+            self.pending_lines
+                .extend(item_history_lines(&item, &self.cwd));
         }
         while !self.pending_lines.is_empty() {
             self.commit_one_streaming_chunk();
@@ -282,7 +311,8 @@ impl Conversation {
     fn finalize_trailing_text(&mut self) {
         if matches!(self.live.last(), Some(Item::Message(_) | Item::Thinking(_))) {
             let item = self.live.pop().expect("trailing item checked above");
-            self.pending_lines.extend(item_history_lines(&item));
+            self.pending_lines
+                .extend(item_history_lines(&item, &self.cwd));
         }
     }
 
@@ -291,7 +321,8 @@ impl Conversation {
     fn promote_done_prefix(&mut self) {
         while self.live.first().is_some_and(Item::is_done) {
             let item = self.live.remove(0);
-            self.pending_lines.extend(item_history_lines(&item));
+            self.pending_lines
+                .extend(item_history_lines(&item, &self.cwd));
         }
     }
 
@@ -316,7 +347,7 @@ impl Conversation {
 /// Frozen scrollback form of a finalized item. This is the permanent record
 /// written to terminal scrollback, so it differs from the live rendering (e.g.
 /// a running tool shows a spinner live but a call/output/result block here).
-fn item_history_lines(item: &Item) -> Vec<HistoryLine> {
+fn item_history_lines(item: &Item, cwd: &Path) -> Vec<HistoryLine> {
     match item {
         Item::Message(text) => {
             if text.is_empty() {
@@ -341,18 +372,37 @@ fn item_history_lines(item: &Item) -> Vec<HistoryLine> {
             output,
             result,
         } => {
-            let mut lines = vec![HistoryLine::normal(format!(
-                "● {}",
-                describe_tool_call(call)
-            ))];
-            for line in output_tail(output, TOOL_OUTPUT_TAIL_LINES) {
+            // A finished call is successful when it has a result whose exit code
+            // is zero or absent (tools without a process exit report `None`). A
+            // missing result means the turn was interrupted mid-flight.
+            let label = describe_tool_call(call, cwd);
+            let mut lines = match result {
+                Some(result) if result.exit_code.unwrap_or(0) == 0 => {
+                    vec![HistoryLine::success(format!("● {label}"))]
+                }
+                _ => vec![HistoryLine::error(format!("✗ {label}"))],
+            };
+            // Prefer live-streamed output, but the core currently runs each tool
+            // to completion and reports its content only in the finished result,
+            // so fall back to the result summary when nothing was streamed.
+            let tail_source = if !output.is_empty() {
+                output.as_str()
+            } else {
+                result.as_ref().map_or("", |result| result.summary.as_str())
+            };
+            for line in output_tail(tail_source, TOOL_OUTPUT_TAIL_LINES) {
                 lines.push(HistoryLine::dim(format!("  {line}")));
             }
-            let status = match result {
-                Some(result) => describe_tool_result(result),
-                None => "interrupted".to_string(),
-            };
-            lines.push(HistoryLine::normal(format!("  {status}")));
+            // Success is already conveyed by the green header; only surface a
+            // trailing status line when it adds information (a failure).
+            match result {
+                Some(result) => {
+                    if let Some(code) = result.exit_code.filter(|code| *code != 0) {
+                        lines.push(HistoryLine::error(format!("  exit {code}")));
+                    }
+                }
+                None => lines.push(HistoryLine::error("  interrupted")),
+            }
             lines
         }
     }
@@ -490,17 +540,17 @@ mod tests {
             },
         );
 
-        // Finishing promotes the whole tool as a unit: call line, a collapsed
-        // output tail (last 3 non-blank lines), then the result line.
+        // Finishing promotes the whole tool as a unit: a green success header
+        // followed by the collapsed output tail (last 3 non-blank lines). A
+        // successful call omits the redundant status line.
         assert!(conv.live.is_empty());
         assert_eq!(
             conv.pending_lines,
             vec![
-                HistoryLine::normal("● shell: cargo test"),
+                HistoryLine::success("● cargo test"),
                 HistoryLine::dim("  line2"),
                 HistoryLine::dim("  line3"),
                 HistoryLine::dim("  line4"),
-                HistoryLine::normal("  exit 0"),
             ]
         );
     }
@@ -536,10 +586,11 @@ mod tests {
         assert_eq!(
             conv.pending_lines,
             vec![
-                HistoryLine::normal("● shell: a"),
-                HistoryLine::normal("  exit 1"),
-                HistoryLine::normal("● shell: b"),
-                HistoryLine::normal("  exit 0"),
+                HistoryLine::error("✗ a"),
+                HistoryLine::dim("  fail"),
+                HistoryLine::error("  exit 1"),
+                HistoryLine::success("● b"),
+                HistoryLine::dim("  ok"),
             ]
         );
     }

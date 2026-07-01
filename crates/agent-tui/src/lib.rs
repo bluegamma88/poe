@@ -17,7 +17,7 @@ use std::{
 
 use agent_core::{AgentSession, ModelClient};
 use agent_exec::{SessionTrace, save_session_trace};
-use agent_protocol::{Event, Op, TokenUsage, ToolCall, ToolResult};
+use agent_protocol::{Event, Op, TokenUsage, ToolCall};
 use composer::{COMPOSER_LEFT_PREFIX, Composer};
 use conversation::{Conversation, Item, LineKind};
 use crossterm::{
@@ -777,6 +777,8 @@ fn history_style(kind: LineKind) -> Style {
         LineKind::Normal => Style::default().fg(Color::White),
         LineKind::Thinking => thinking_style(),
         LineKind::Dim => Style::default().fg(Color::DarkGray),
+        LineKind::Success => Style::default().fg(Color::Green),
+        LineKind::Error => Style::default().fg(Color::Red),
         LineKind::User => Style::default().fg(Color::White).bg(Color::Indexed(238)),
     }
 }
@@ -816,7 +818,7 @@ fn render_live(frame: &mut custom_terminal::Frame<'_>, area: Rect, app: &AppStat
                 lines.push(Line::from(vec![
                     Span::styled(format!("{spinner} "), Style::default().fg(Color::Cyan)),
                     Span::styled(
-                        describe_tool_call(call),
+                        describe_tool_call(call, &app.cwd),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
@@ -929,11 +931,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(model: String, cwd: PathBuf) -> Self {
+        let mut log = Conversation::new();
+        log.set_cwd(cwd.clone());
         Self {
             model,
             cwd,
             composer: Composer::new(),
-            log: Conversation::new(),
+            log,
             running: false,
             scroll_offset: 0,
             key_debug: false,
@@ -1055,8 +1059,8 @@ impl AppState {
                     rows += wrapped_line_count(text, width);
                 }
                 Item::Tool { call, .. } => {
-                    // "⠋ shell: ls -la" — spinner char + space + description
-                    let desc = describe_tool_call(call);
+                    // "⠋ Read foo.rs" — spinner char + space + description
+                    let desc = describe_tool_call(call, &self.cwd);
                     let char_count = 2 + desc.chars().count(); // spinner + space
                     rows += char_count.max(1).div_ceil(width) as u16;
                 }
@@ -1085,34 +1089,68 @@ fn wrapped_line_count(text: &str, width: usize) -> u16 {
         .sum()
 }
 
-fn describe_tool_call(call: &ToolCall) -> String {
+/// A human-readable, single-line label for a tool call: an action verb plus a
+/// cwd-relative target (or, for `shell`, the command itself). Used for both the
+/// live spinner line and the finalized scrollback header.
+fn describe_tool_call(call: &ToolCall, cwd: &Path) -> String {
     match call.name.as_str() {
         "shell" => call
             .input
             .get("command")
             .and_then(serde_json::Value::as_str)
-            .map(|command| format!("shell: {command}"))
+            .map(shell_command_label)
             .unwrap_or_else(|| "shell".to_string()),
-        "read_file" => describe_tool_target(call, "file_path", "read_file"),
-        "list_dir" => describe_tool_target(call, "dir_path", "list_dir"),
-        "edit_file" => describe_tool_target(call, "file_path", "edit_file"),
-        "write_file" => describe_tool_target(call, "file_path", "write_file"),
+        "read_file" => describe_read(call, cwd),
+        "list_dir" => describe_tool_target(call, "dir_path", "List", cwd),
+        "edit_file" => describe_tool_target(call, "file_path", "Edit", cwd),
+        "write_file" => describe_tool_target(call, "file_path", "Write", cwd),
         name => name.to_string(),
     }
 }
 
-fn describe_tool_target(call: &ToolCall, key: &str, fallback: &str) -> String {
+/// Collapse a shell command to a single display line, keeping internal spacing.
+fn shell_command_label(command: &str) -> String {
+    let one_line = command.replace(['\n', '\r'], " ");
+    let trimmed = one_line.trim();
+    if trimmed.is_empty() {
+        "shell".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// `Read foo.rs`, `Read foo.rs:10`, or `Read foo.rs:10-49` (offset + limit).
+fn describe_read(call: &ToolCall, cwd: &Path) -> String {
+    let Some(path) = call.input.get("file_path").and_then(serde_json::Value::as_str) else {
+        return "Read".to_string();
+    };
+    let rel = relativize_path(path, cwd);
+    match call.input.get("offset").and_then(serde_json::Value::as_u64) {
+        Some(offset) => match call.input.get("limit").and_then(serde_json::Value::as_u64) {
+            Some(limit) if limit > 0 => format!("Read {rel}:{offset}-{}", offset + limit - 1),
+            _ => format!("Read {rel}:{offset}"),
+        },
+        None => format!("Read {rel}"),
+    }
+}
+
+fn describe_tool_target(call: &ToolCall, key: &str, verb: &str, cwd: &Path) -> String {
     call.input
         .get(key)
         .and_then(serde_json::Value::as_str)
-        .map(|target| format!("{fallback}: {target}"))
-        .unwrap_or_else(|| fallback.to_string())
+        .map(|target| format!("{verb} {}", relativize_path(target, cwd)))
+        .unwrap_or_else(|| verb.to_string())
 }
 
-fn describe_tool_result(result: &ToolResult) -> String {
-    match result.exit_code {
-        Some(code) => format!("exit {code}"),
-        None => "done".to_string(),
+/// Strip `cwd` from `path` for a compact display form, falling back to the
+/// original string when `path` is outside `cwd` or `cwd` is unset.
+fn relativize_path(path: &str, cwd: &Path) -> String {
+    if cwd.as_os_str().is_empty() {
+        return path.to_string();
+    }
+    match Path::new(path).strip_prefix(cwd) {
+        Ok(rel) if !rel.as_os_str().is_empty() => rel.to_string_lossy().into_owned(),
+        _ => path.to_string(),
     }
 }
 
@@ -1233,6 +1271,51 @@ mod tests {
             format_usage(&usage),
             "$0.0142 · ↑12.4k (8.1k cached, 2.0k write) ↓940"
         );
+    }
+
+    #[test]
+    fn describe_tool_call_uses_verbs_and_relative_paths() {
+        let cwd = Path::new("/tmp/project");
+
+        let read = ToolCall {
+            id: "1".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({ "file_path": "/tmp/project/src/lib.rs" }),
+        };
+        assert_eq!(describe_tool_call(&read, cwd), "Read src/lib.rs");
+
+        let read_range = ToolCall {
+            id: "2".to_string(),
+            name: "read_file".to_string(),
+            input: serde_json::json!({
+                "file_path": "/tmp/project/src/lib.rs",
+                "offset": 10,
+                "limit": 40,
+            }),
+        };
+        assert_eq!(describe_tool_call(&read_range, cwd), "Read src/lib.rs:10-49");
+
+        let edit = ToolCall {
+            id: "3".to_string(),
+            name: "edit_file".to_string(),
+            input: serde_json::json!({ "file_path": "/tmp/project/a.txt" }),
+        };
+        assert_eq!(describe_tool_call(&edit, cwd), "Edit a.txt");
+
+        let shell = ToolCall {
+            id: "4".to_string(),
+            name: "shell".to_string(),
+            input: serde_json::json!({ "command": "cargo test\n" }),
+        };
+        assert_eq!(describe_tool_call(&shell, cwd), "cargo test");
+    }
+
+    #[test]
+    fn relativize_path_falls_back_outside_cwd() {
+        let cwd = Path::new("/tmp/project");
+        assert_eq!(relativize_path("/etc/hosts", cwd), "/etc/hosts");
+        // An unset cwd leaves paths untouched.
+        assert_eq!(relativize_path("/tmp/project/x", Path::new("")), "/tmp/project/x");
     }
 
     #[test]
