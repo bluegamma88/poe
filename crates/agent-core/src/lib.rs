@@ -28,9 +28,9 @@ use serde_json::Value;
 const MAX_TOOL_ROUNDS: usize = 250;
 const SYSTEM_PROMPT: &str =
     "You are a coding agent. Write final responses in plain text, not Markdown.";
-const OPENROUTER_RETRY_MAX_ATTEMPTS: usize = 3;
+const OPENROUTER_RETRY_MAX_ATTEMPTS: usize = 4;
 const OPENROUTER_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
-const OPENROUTER_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
+const OPENROUTER_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
 
 pub fn available_tool_definitions() -> Vec<Value> {
     vec![
